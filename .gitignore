@@ -6,3 +6,5 @@ riderModule.iml
 .idea/
 DDXConv/Fallout_Release_Beta.exe.c
 DDXConv/Fallout_Release_Beta.exe.h
+*.ddx
+*.dds
