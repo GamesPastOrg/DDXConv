@@ -655,17 +655,23 @@ namespace DDXConv
         private uint GetDxgiFormat(uint gpuFormat)
         {
             // Map Xbox 360 GPU texture formats to D3D formats
-            // Note: gpuFormat values are from Xenia's TextureFormat enum (6-bit field from dword_1)
+            // For 0x82 base format, the actual format is determined by DWORD[4]
             
             return gpuFormat switch
             {
-                0x12 => 0x31545844, // k_DXT1 (18) - DXT1
-                0x13 => 0x33545844, // k_DXT2_3 (19) - DXT3  
-                0x14 => 0x35545844, // k_DXT4_5 (20) - DXT5
-                0x3A => 0x32495441, // k_DXT3A (58) - ATI2/BC5 normal maps
-                0x3B => 0x31495441, // k_DXT5A (59) - ATI1/BC4 single channel (specular maps)
-                0x06 => 0x18280046, // k_8_8_8_8 (6) -> A8R8G8B8
-                0x04 => 0x28280044, // k_5_6_5 (4) -> R5G6B5
+                0x52 => 0x31545844, // DXT1
+                0x53 => 0x33545844, // DXT3  
+                0x54 => 0x35545844, // DXT5
+                0x71 => 0x32495441, // ATI2 (BC5) - Xbox 360 normal map format
+                0x7B => 0x31495441, // ATI1 (BC4) - Single channel format (specular maps)
+                0x82 => 0x31545844, // DXT1 (default when DWORD[4] is 0)
+                0x86 => 0x31545844, // DXT1 variant
+                0x88 => 0x35545844, // DXT5 variant
+                0x12 => 0x31545844, // GPUTEXTUREFORMAT_DXT1
+                0x13 => 0x33545844, // GPUTEXTUREFORMAT_DXT2/3
+                0x14 => 0x35545844, // GPUTEXTUREFORMAT_DXT4/5
+                0x06 => 0x18280046, // GPUTEXTUREFORMAT_8_8_8_8 -> A8R8G8B8
+                0x04 => 0x28280044, // GPUTEXTUREFORMAT_5_6_5 -> R5G6B5
                 _ => 0x31545844 // Default to DXT1
             };
         }
