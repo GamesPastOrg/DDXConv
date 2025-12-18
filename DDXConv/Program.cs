@@ -2,6 +2,7 @@
 using System.IO;
 
 namespace DDXConv;
+
 internal class Program
 {
     private static void Main(string[] args)
@@ -17,7 +18,7 @@ internal class Program
         foreach (var a in args)
             if (a.StartsWith('-')) opts.Add(a);
             else positional.Add(a);
-        
+
         if (opts.Contains("--help") || opts.Contains("-h"))
         {
             Console.WriteLine("Single File: DDXConv <input_file> [output_file] [options]");
@@ -30,6 +31,7 @@ internal class Program
             Console.WriteLine("  --raw, -r            Save raw combined decompressed data as binary file");
             Console.WriteLine("  --save-mips          Save extracted mip levels from atlas");
             Console.WriteLine("  --no-untile-atlas    Do not untile/unswizzle the atlas (leave tiled)");
+            Console.WriteLine("  --no-untile          Do not untile/unswizzle ANY data (for debugging)");
             Console.WriteLine("  --no-swap            Do not perform endian swap on data");
             Console.WriteLine("  --verbose, -v        Enable verbose output");
             return;
@@ -42,6 +44,7 @@ internal class Program
         var saveRaw = opts.Contains("--raw") || opts.Contains("-r");
         var saveMips = opts.Contains("--save-mips");
         var noUntileAtlas = opts.Contains("--no-untile-atlas");
+        var noUntile = opts.Contains("--no-untile");
         var skipEndianSwap = opts.Contains("--no-swap");
         var verbose = opts.Contains("--verbose") || opts.Contains("-v");
 
@@ -75,8 +78,12 @@ internal class Program
                     parser.ConvertDdxToDds(ddxFile, outputBatchPath,
                         new ConversionOptions
                         {
-                            SaveAtlas = saveAtlas, SaveRaw = saveRaw, SaveMips = saveMips,
-                            NoUntileAtlas = noUntileAtlas, SkipEndianSwap = skipEndianSwap
+                            SaveAtlas = saveAtlas,
+                            SaveRaw = saveRaw,
+                            SaveMips = saveMips,
+                            NoUntileAtlas = noUntileAtlas,
+                            NoUntile = noUntile,
+                            SkipEndianSwap = skipEndianSwap
                         });
                     Console.WriteLine($"Converted {ddxFile} to {outputBatchPath}");
                     if (regenMips) DdsPostProcessor.RegenerateMips(outputBatchPath);
@@ -116,7 +123,7 @@ internal class Program
                     }
                 }
             }
-            
+
             return;
         }
 
@@ -134,7 +141,11 @@ internal class Program
             parser.ConvertDdxToDds(inputPath, outputPath,
                 new ConversionOptions
                 {
-                    SaveAtlas = saveAtlas, SaveRaw = saveRaw, SaveMips = saveMips, NoUntileAtlas = noUntileAtlas,
+                    SaveAtlas = saveAtlas,
+                    SaveRaw = saveRaw,
+                    SaveMips = saveMips,
+                    NoUntileAtlas = noUntileAtlas,
+                    NoUntile = noUntile,
                     SkipEndianSwap = skipEndianSwap
                 });
             Console.WriteLine($"Successfully converted {inputPath} to {outputPath}");
