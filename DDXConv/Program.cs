@@ -1,4 +1,3 @@
-
 using DDXConv;
 
 if (args.Length < 1)
@@ -9,17 +8,11 @@ if (args.Length < 1)
 
 var opts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 var positional = new List<string>();
-foreach (string a in args)
-{
+foreach (var a in args)
     if (a.StartsWith('-'))
-    {
         opts.Add(a);
-    }
     else
-    {
         positional.Add(a);
-    }
-}
 
 if (opts.Contains("--help") || opts.Contains("-h"))
 {
@@ -44,17 +37,17 @@ if (opts.Contains("--help") || opts.Contains("-h"))
     return;
 }
 
-string inputPath = positional[0];
-bool pcFriendly = opts.Contains("--pc-friendly") || opts.Contains("-pc");
-bool regenMips = opts.Contains("--regen-mips") || opts.Contains("-g");
-bool memoryMode = opts.Contains("--memory") || opts.Contains("-m");
-bool saveAtlas = opts.Contains("--atlas") || opts.Contains("-a");
-bool saveRaw = opts.Contains("--raw") || opts.Contains("-r");
-bool saveMips = opts.Contains("--save-mips");
-bool noUntileAtlas = opts.Contains("--no-untile-atlas");
-bool noUntile = opts.Contains("--no-untile");
-bool skipEndianSwap = opts.Contains("--no-swap");
-bool verbose = opts.Contains("--verbose") || opts.Contains("-v");
+var inputPath = positional[0];
+var pcFriendly = opts.Contains("--pc-friendly") || opts.Contains("-pc");
+var regenMips = opts.Contains("--regen-mips") || opts.Contains("-g");
+var memoryMode = opts.Contains("--memory") || opts.Contains("-m");
+var saveAtlas = opts.Contains("--atlas") || opts.Contains("-a");
+var saveRaw = opts.Contains("--raw") || opts.Contains("-r");
+var saveMips = opts.Contains("--save-mips");
+var noUntileAtlas = opts.Contains("--no-untile-atlas");
+var noUntile = opts.Contains("--no-untile");
+var skipEndianSwap = opts.Contains("--no-swap");
+var verbose = opts.Contains("--verbose") || opts.Contains("-v");
 
 if (Directory.Exists(inputPath))
 {
@@ -65,19 +58,19 @@ if (Directory.Exists(inputPath))
         return;
     }
 
-    string outputDir = positional[1];
+    var outputDir = positional[1];
     Directory.CreateDirectory(outputDir);
 
-    string[] ddxFiles = Directory.GetFiles(inputPath, "*.ddx", SearchOption.AllDirectories);
+    var ddxFiles = Directory.GetFiles(inputPath, "*.ddx", SearchOption.AllDirectories);
 
-    int errors = 0;
+    var errors = 0;
     var failed = new List<(string name, string error)>();
-    int invalids = 0;
+    var invalids = 0;
 
-    foreach (string ddxFile in ddxFiles)
+    foreach (var ddxFile in ddxFiles)
     {
-        string relativePath = Path.GetRelativePath(inputPath, ddxFile);
-        string outputBatchPath = Path.Combine(outputDir, Path.ChangeExtension(relativePath, ".dds"));
+        var relativePath = Path.GetRelativePath(inputPath, ddxFile);
+        var outputBatchPath = Path.Combine(outputDir, Path.ChangeExtension(relativePath, ".dds"));
         Directory.CreateDirectory(Path.GetDirectoryName(outputBatchPath)!);
 
         try
@@ -86,7 +79,8 @@ if (Directory.Exists(inputPath))
             {
                 // Use MemoryTextureParser for textures carved from memory dumps
                 var memoryParser = new MemoryTextureParser(verbose);
-                MemoryTextureParser.ConversionResult result = memoryParser.ConvertFromMemory(ddxFile, outputBatchPath, saveAtlas, saveRaw);
+                var result =
+                    memoryParser.ConvertFromMemory(ddxFile, outputBatchPath, saveAtlas, saveRaw);
 
                 if (result.Success)
                 {
@@ -116,10 +110,8 @@ if (Directory.Exists(inputPath))
                     });
                 Console.WriteLine($"Converted {ddxFile} to {outputBatchPath}");
             }
-            if (regenMips)
-            {
-                DdsPostProcessor.RegenerateMips(outputBatchPath);
-            }
+
+            if (regenMips) DdsPostProcessor.RegenerateMips(outputBatchPath);
         }
         catch (NotSupportedException)
         {
@@ -135,19 +127,16 @@ if (Directory.Exists(inputPath))
 
     Console.WriteLine(
         $"Batch conversion completed. Successfully converted {ddxFiles.Length - errors - invalids} out of {ddxFiles.Length} files ({errors} failures, {invalids} unsupported).");
-    foreach ((string name, string error) in failed)
-    {
-        Console.Write($"- {name}: {error}\n");
-    }
+    foreach (var (name, error) in failed) Console.Write($"- {name}: {error}\n");
 
     if (pcFriendly)
     {
         // cycle through output directory and process normal + specular maps
-        string[] ddsFiles = Directory.GetFiles(outputDir, "*_n.dds", SearchOption.AllDirectories);
-        foreach (string ddsFile in ddsFiles)
+        var ddsFiles = Directory.GetFiles(outputDir, "*_n.dds", SearchOption.AllDirectories);
+        foreach (var ddsFile in ddsFiles)
         {
             // check if file with same name but _s.dds exists
-            string specFile = ddsFile.Replace("_n.dds", "_s.dds", StringComparison.Ordinal);
+            var specFile = ddsFile.Replace("_n.dds", "_s.dds", StringComparison.Ordinal);
             try
             {
                 DdsPostProcessor.MergeNormalSpecularMaps(ddsFile, File.Exists(specFile) ? specFile : null);
@@ -169,7 +158,7 @@ if (!File.Exists(inputPath))
     return;
 }
 
-string outputPath = positional.Count > 1 ? positional[1] : Path.ChangeExtension(inputPath, ".dds");
+var outputPath = positional.Count > 1 ? positional[1] : Path.ChangeExtension(inputPath, ".dds");
 
 try
 {
@@ -177,15 +166,13 @@ try
     {
         // Use MemoryTextureParser for textures carved from memory dumps
         var memoryParser = new MemoryTextureParser(verbose);
-        MemoryTextureParser.ConversionResult result = memoryParser.ConvertFromMemory(inputPath, outputPath, saveAtlas, saveRaw);
+        var result =
+            memoryParser.ConvertFromMemory(inputPath, outputPath, saveAtlas, saveRaw);
 
         if (result.Success)
         {
             Console.WriteLine($"Successfully converted memory texture {inputPath} to {outputPath}");
-            if (result.AtlasData != null && saveAtlas)
-            {
-                Console.WriteLine($"  Atlas saved: {result.AtlasPath}");
-            }
+            if (result.AtlasData != null && saveAtlas) Console.WriteLine($"  Atlas saved: {result.AtlasPath}");
         }
         else
         {
@@ -211,10 +198,10 @@ try
     }
 
     // Regenerate mips unless disabled or if PC-friendly normal map case (no reason to add another re-encode since normal merge regenerates mips)
-    if (!regenMips || ((inputPath.EndsWith("_s.dds", StringComparison.OrdinalIgnoreCase) || inputPath.EndsWith("_n.dds", StringComparison.OrdinalIgnoreCase)) && pcFriendly))
-    {
+    if (!regenMips ||
+        ((inputPath.EndsWith("_s.dds", StringComparison.OrdinalIgnoreCase) ||
+          inputPath.EndsWith("_n.dds", StringComparison.OrdinalIgnoreCase)) && pcFriendly))
         return;
-    }
 
     DdsPostProcessor.RegenerateMips(outputPath);
 }

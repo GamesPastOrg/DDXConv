@@ -1,7 +1,7 @@
 namespace DDXConv;
 
 /// <summary>
-/// Writes DDS (DirectDraw Surface) files.
+///     Writes DDS (DirectDraw Surface) files.
 /// </summary>
 public static class DdsWriter
 {
@@ -19,13 +19,13 @@ public static class DdsWriter
     private const uint DDSCAPS_COMPLEX = 0x8;
 
     /// <summary>
-    /// Write a DDS file with the given texture data.
+    ///     Write a DDS file with the given texture data.
     /// </summary>
     public static void WriteDdsFile(string outputPath, D3DTextureInfo texture, byte[] mainData)
     {
         ArgumentNullException.ThrowIfNull(texture);
 
-        using FileStream stream = File.Create(outputPath);
+        using var stream = File.Create(outputPath);
         using var writer = new BinaryWriter(stream);
 
         // DDS magic
@@ -39,7 +39,7 @@ public static class DdsWriter
     }
 
     /// <summary>
-    /// Write a DDS file with explicit dimensions and format.
+    ///     Write a DDS file with explicit dimensions and format.
     /// </summary>
     public static void WriteDdsFile(string outputPath, int width, int height, int mipLevels, uint format, byte[] data)
     {
@@ -56,17 +56,11 @@ public static class DdsWriter
 
     private static void WriteDdsHeader(BinaryWriter writer, D3DTextureInfo texture)
     {
-        uint flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_LINEARSIZE;
-        if (texture.MipLevels > 1)
-        {
-            flags |= DDSD_MIPMAPCOUNT;
-        }
+        var flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_LINEARSIZE;
+        if (texture.MipLevels > 1) flags |= DDSD_MIPMAPCOUNT;
 
-        uint caps = DDSCAPS_TEXTURE;
-        if (texture.MipLevels > 1)
-        {
-            caps |= DDSCAPS_MIPMAP | DDSCAPS_COMPLEX;
-        }
+        var caps = DDSCAPS_TEXTURE;
+        if (texture.MipLevels > 1) caps |= DDSCAPS_MIPMAP | DDSCAPS_COMPLEX;
 
         // Size (always 124 for standard DDS header)
         writer.Write(124u);
@@ -84,10 +78,7 @@ public static class DdsWriter
         writer.Write(texture.MipLevels);
 
         // Reserved (11 dwords)
-        for (int i = 0; i < 11; i++)
-        {
-            writer.Write(0u);
-        }
+        for (var i = 0; i < 11; i++) writer.Write(0u);
 
         // Pixel format
         WriteDdsPixelFormat(writer, texture.Format);

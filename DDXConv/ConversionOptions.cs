@@ -7,7 +7,7 @@ public class ConversionOptions
     public bool SaveMips { get; set; }
     public bool NoUntileAtlas { get; set; }
     public bool SkipEndianSwap { get; set; }
-    public bool NoUntile { get; set; }  // Skip ALL untiling - output raw tiled data
+    public bool NoUntile { get; set; } // Skip ALL untiling - output raw tiled data
 
     // Experimental: allow processing 3XDR files instead of failing fast
     public bool Enable3Xdr { get; set; }
