@@ -23,7 +23,9 @@ public static class DdsWriter
     /// </summary>
     public static void WriteDdsFile(string outputPath, D3DTextureInfo texture, byte[] mainData)
     {
-        using var stream = File.Create(outputPath);
+        ArgumentNullException.ThrowIfNull(texture);
+
+        using FileStream stream = File.Create(outputPath);
         using var writer = new BinaryWriter(stream);
 
         // DDS magic
@@ -55,28 +57,37 @@ public static class DdsWriter
     private static void WriteDdsHeader(BinaryWriter writer, D3DTextureInfo texture)
     {
         uint flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_LINEARSIZE;
-        if (texture.MipLevels > 1) flags |= DDSD_MIPMAPCOUNT;
+        if (texture.MipLevels > 1)
+        {
+            flags |= DDSD_MIPMAPCOUNT;
+        }
 
         uint caps = DDSCAPS_TEXTURE;
-        if (texture.MipLevels > 1) caps |= DDSCAPS_MIPMAP | DDSCAPS_COMPLEX;
+        if (texture.MipLevels > 1)
+        {
+            caps |= DDSCAPS_MIPMAP | DDSCAPS_COMPLEX;
+        }
 
         // Size (always 124 for standard DDS header)
         writer.Write(124u);
         // Flags
         writer.Write(flags);
         // Height
-        writer.Write((uint)texture.Height);
+        writer.Write(texture.Height);
         // Width
-        writer.Write((uint)texture.Width);
+        writer.Write(texture.Width);
         // Pitch or linear size (size of top-level mip)
         writer.Write(TextureUtilities.CalculateMipSize(texture.Width, texture.Height, texture.ActualFormat));
         // Depth
         writer.Write(0u);
         // Mip map count
-        writer.Write((uint)texture.MipLevels);
+        writer.Write(texture.MipLevels);
 
         // Reserved (11 dwords)
-        for (int i = 0; i < 11; i++) writer.Write(0u);
+        for (int i = 0; i < 11; i++)
+        {
+            writer.Write(0u);
+        }
 
         // Pixel format
         WriteDdsPixelFormat(writer, texture.Format);

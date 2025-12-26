@@ -37,24 +37,13 @@ public static class TextureUtilities
     /// </summary>
     public static int GetBlockSize(uint format)
     {
-        switch (format)
+        return format switch
         {
-            case 0x52: // DXT1
-            case 0x7B: // ATI1/BC4
-            case 0x82: // DXT1 variant
-            case 0x86: // DXT1 variant
-            case 0x12: // GPUTEXTUREFORMAT_DXT1
-                return 8;
-
-            case 0x53: // DXT3
-            case 0x54: // DXT5
-            case 0x71: // DXT5 variant (normal maps)
-            case 0x88: // DXT5 variant
-            case 0x13: // GPUTEXTUREFORMAT_DXT2/3
-            case 0x14: // GPUTEXTUREFORMAT_DXT4/5
-            default:
-                return 16;
-        }
+            // DXT1
+            0x52 or 0x7B or 0x82 or 0x86 or 0x12 => 8,
+            // DXT3
+            _ => 16,
+        };
     }
 
     /// <summary>
@@ -79,8 +68,8 @@ public static class TextureUtilities
     public static uint CalculateMipLevels(uint width, uint height)
     {
         uint levels = 1;
-        var w = width;
-        var h = height;
+        uint w = width;
+        uint h = height;
 
         while (w > 1 || h > 1)
         {
@@ -97,41 +86,24 @@ public static class TextureUtilities
     /// </summary>
     public static uint CalculateMipSize(uint width, uint height, uint format)
     {
-        switch (format)
+        return format switch
         {
-            case 0x52: // DXT1
-            case 0x7B: // ATI1/BC4
-            case 0x82: // DXT1 variant
-            case 0x86: // DXT1 variant
-            case 0x12: // GPUTEXTUREFORMAT_DXT1
-                return Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 8;
-
-            case 0x53: // DXT3
-            case 0x54: // DXT5
-            case 0x71: // DXT5 variant (normal maps)
-            case 0x88: // DXT5 variant
-            case 0x13: // GPUTEXTUREFORMAT_DXT2/3
-            case 0x14: // GPUTEXTUREFORMAT_DXT4/5
-                return Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 16;
-
-            case 0x06: // A8R8G8B8 - 32 bits per pixel
-                return width * height * 4;
-
-            case 0x04: // R5G6B5 - 16 bits per pixel
-                return width * height * 2;
-
-            default:
-                return width * height * 4; // Default to 32bpp
-        }
+            // DXT1
+            0x52 or 0x7B or 0x82 or 0x86 or 0x12 => Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 8,
+            // DXT3
+            0x53 or 0x54 or 0x71 or 0x88 or 0x13 or 0x14 => Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 16,
+            // A8R8G8B8 - 32 bits per pixel
+            0x06 => width * height * 4,
+            // R5G6B5 - 16 bits per pixel
+            0x04 => width * height * 2,
+            _ => width * height * 4,// Default to 32bpp
+        };
     }
 
     /// <summary>
     /// Calculate byte size for a single mip level (int overload).
     /// </summary>
-    public static int CalculateMipSize(int width, int height, uint format)
-    {
-        return (int)CalculateMipSize((uint)width, (uint)height, format);
-    }
+    public static int CalculateMipSize(int width, int height, uint format) => (int)CalculateMipSize((uint)width, (uint)height, format);
 
     /// <summary>
     /// Calculate total size of a mip chain from given dimensions down to smallest mip.
@@ -139,12 +111,12 @@ public static class TextureUtilities
     public static uint CalculateMainDataSize(uint width, uint height, uint format, uint mipLevels)
     {
         uint totalSize = 0;
-        var w = width;
-        var h = height;
+        uint w = width;
+        uint h = height;
 
-        for (var i = 0; i < mipLevels; i++)
+        for (int i = 0; i < mipLevels; i++)
         {
-            var mipSize = CalculateMipSize(w, h, format);
+            uint mipSize = CalculateMipSize(w, h, format);
             totalSize += mipSize;
 
             w = Math.Max(1, w / 2);
@@ -160,8 +132,8 @@ public static class TextureUtilities
     public static uint CalculateMipChainSize(int width, int height, uint format)
     {
         uint totalSize = 0;
-        var w = width;
-        var h = height;
+        int w = width;
+        int h = height;
         while (w >= 4 && h >= 4)
         {
             totalSize += (uint)CalculateMipSize(w, h, format);
@@ -174,11 +146,9 @@ public static class TextureUtilities
     /// <summary>
     /// Calculate DDS row pitch for given width and format.
     /// </summary>
-    public static uint CalculatePitch(uint width, uint format)
-    {
+    public static uint CalculatePitch(uint width, uint format) =>
         // For DXT formats, pitch is the row of 4x4 blocks
-        return Math.Max(1, (width + 3) / 4) * (uint)GetBlockSize(format);
-    }
+        Math.Max(1, (width + 3) / 4) * (uint)GetBlockSize(format);
 
     #endregion
 
@@ -190,6 +160,8 @@ public static class TextureUtilities
     /// </summary>
     public static byte[] UnswizzleDXTTexture(byte[] src, int width, int height, uint format)
     {
+        ArgumentNullException.ThrowIfNull(src);
+
         int blockSize = GetBlockSize(format);
         int blocksWide = (width + 3) / 4;
         int blocksHigh = (height + 3) / 4;
@@ -199,17 +171,17 @@ public static class TextureUtilities
         if (src.Length < expectedSize)
         {
             // Pad if source is smaller
-            var padded = new byte[expectedSize];
+            byte[] padded = new byte[expectedSize];
             Array.Copy(src, padded, src.Length);
             src = padded;
         }
 
-        var dst = new byte[expectedSize];
+        byte[] dst = new byte[expectedSize];
 
         // Calculate log2 of bytes per pixel for tiling
         // DXT1: 8 bytes/block, 4x4 = 16 pixels, so 0.5 bytes/pixel -> log2 = -1, but we use block-based calculation
         // We actually use log2 of (blockSize / 4) since we're processing 4-pixel wide blocks
-        uint log2Bpp = (uint)(blockSize / 4 + ((blockSize / 2) >> (blockSize / 4)));
+        uint log2Bpp = (uint)((blockSize / 4) + ((blockSize / 2) >> (blockSize / 4)));
 
         for (int y = 0; y < blocksHigh; y++)
         {
@@ -220,7 +192,7 @@ public static class TextureUtilities
                 uint inputOffset = TiledOffset2DColumn((uint)x, (uint)y, log2Bpp, inputRowOffset);
                 inputOffset >>= (int)log2Bpp;
 
-                int dstOffset = (y * blocksWide + x) * blockSize;
+                int dstOffset = ((y * blocksWide) + x) * blockSize;
                 int srcOffset = (int)inputOffset * blockSize;
 
                 if (srcOffset + blockSize <= src.Length && dstOffset + blockSize <= dst.Length)
@@ -239,8 +211,8 @@ public static class TextureUtilities
     public static uint TiledOffset2DRow(uint y, uint width, uint log2Bpp)
     {
         uint macro = ((y >> 5) * ((width >> 5) << (int)log2Bpp)) << 11;
-        uint micro = (((y & 6) >> 1) << (int)log2Bpp) << 6;
-        return macro + ((micro + ((y & 8) << (3 + (int)log2Bpp)) + ((y & 1) << 4)));
+        uint micro = ((y & 6) >> 1) << (int)log2Bpp << 6;
+        return macro + micro + ((y & 8) << (3 + (int)log2Bpp)) + ((y & 1) << 4);
     }
 
     /// <summary>
@@ -248,13 +220,13 @@ public static class TextureUtilities
     /// </summary>
     public static uint TiledOffset2DColumn(uint x, uint y, uint log2Bpp, uint baseOffset)
     {
-        uint macro = ((x >> 5) << (int)log2Bpp) << 11;
-        uint micro = ((x & 7) << (int)log2Bpp) << 6;
-        uint offset = baseOffset + (macro + ((micro + ((x & 8) << (3 + (int)log2Bpp)) + ((x & 16) << 2) +
-                                              ((x & ~31u) << (int)log2Bpp))));
+        uint macro = (x >> 5) << (int)log2Bpp << 11;
+        uint micro = (x & 7) << (int)log2Bpp << 6;
+        uint offset = baseOffset + macro + micro + ((x & 8) << (3 + (int)log2Bpp)) + ((x & 16) << 2) +
+                                              ((x & ~31u) << (int)log2Bpp);
 
         return ((offset >> 6) << 12) + ((y & 16) << 7) +
-               ((offset & 0x3f) << 6) + (((x & 16) >> 2) | ((~(y & 16)) >> 2) & 4) +
+               ((offset & 0x3f) << 6) + (((x & 16) >> 2) | (((~(y & 16)) >> 2) & 4)) +
                ((((y >> 3) ^ x) & 2) | (((y >> 2) ^ x) & 1));
     }
 
@@ -269,6 +241,8 @@ public static class TextureUtilities
     public static byte[]? ExtractAtlasRegion(byte[] atlasData, int atlasWidth, int atlasHeight,
         int regionX, int regionY, int regionWidth, int regionHeight, uint format)
     {
+        ArgumentNullException.ThrowIfNull(atlasData);
+
         int blockSize = GetBlockSize(format);
         int blockWidth = 4; // DXT block size in pixels
         int blockHeight = 4;
@@ -282,20 +256,26 @@ public static class TextureUtilities
         int startBlockY = regionY / blockHeight;
 
         int outputSize = regionBlocksX * regionBlocksY * blockSize;
-        var output = new byte[outputSize];
+        byte[] output = new byte[outputSize];
 
         int destOffset = 0;
         for (int by = 0; by < regionBlocksY; by++)
         {
             int srcBlockY = startBlockY + by;
-            if (srcBlockY >= atlasBlocksY) break;
+            if (srcBlockY >= atlasBlocksY)
+            {
+                break;
+            }
 
             for (int bx = 0; bx < regionBlocksX; bx++)
             {
                 int srcBlockX = startBlockX + bx;
-                if (srcBlockX >= atlasBlocksX) continue;
+                if (srcBlockX >= atlasBlocksX)
+                {
+                    continue;
+                }
 
-                int srcOffset = (srcBlockY * atlasBlocksX + srcBlockX) * blockSize;
+                int srcOffset = ((srcBlockY * atlasBlocksX) + srcBlockX) * blockSize;
 
                 if (srcOffset + blockSize <= atlasData.Length && destOffset + blockSize <= output.Length)
                 {
@@ -314,6 +294,9 @@ public static class TextureUtilities
     public static byte[] InterleaveHorizontalChunks(byte[] leftChunk, byte[] rightChunk,
         int leftWidth, int rightWidth, int height, uint format)
     {
+        ArgumentNullException.ThrowIfNull(leftChunk);
+        ArgumentNullException.ThrowIfNull(rightChunk);
+
         int blockSize = GetBlockSize(format);
         int totalWidth = leftWidth + rightWidth;
         int totalBlocksWide = (totalWidth + 3) / 4;
@@ -321,15 +304,15 @@ public static class TextureUtilities
         int rightBlocksWide = (rightWidth + 3) / 4;
         int blocksHigh = (height + 3) / 4;
 
-        var result = new byte[totalBlocksWide * blocksHigh * blockSize];
+        byte[] result = new byte[totalBlocksWide * blocksHigh * blockSize];
 
         for (int y = 0; y < blocksHigh; y++)
         {
             // Copy left chunk blocks
             for (int x = 0; x < leftBlocksWide; x++)
             {
-                int srcOffset = (y * leftBlocksWide + x) * blockSize;
-                int dstOffset = (y * totalBlocksWide + x) * blockSize;
+                int srcOffset = ((y * leftBlocksWide) + x) * blockSize;
+                int dstOffset = ((y * totalBlocksWide) + x) * blockSize;
                 if (srcOffset + blockSize <= leftChunk.Length && dstOffset + blockSize <= result.Length)
                 {
                     Array.Copy(leftChunk, srcOffset, result, dstOffset, blockSize);
@@ -339,8 +322,8 @@ public static class TextureUtilities
             // Copy right chunk blocks
             for (int x = 0; x < rightBlocksWide; x++)
             {
-                int srcOffset = (y * rightBlocksWide + x) * blockSize;
-                int dstOffset = (y * totalBlocksWide + leftBlocksWide + x) * blockSize;
+                int srcOffset = ((y * rightBlocksWide) + x) * blockSize;
+                int dstOffset = ((y * totalBlocksWide) + leftBlocksWide + x) * blockSize;
                 if (srcOffset + blockSize <= rightChunk.Length && dstOffset + blockSize <= result.Length)
                 {
                     Array.Copy(rightChunk, srcOffset, result, dstOffset, blockSize);

@@ -1,7 +1,4 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
+using XCompression;
 
 namespace DDXConv;
 
@@ -68,9 +65,11 @@ public class MemoryTextureParser
         }
 
         // Convert
-        var result = ConvertFromMemory(data, saveAtlas);
+        ConversionResult result = ConvertFromMemory(data, saveAtlas);
         if (!result.Success)
+        {
             return result;
+        }
 
         // Write output DDS
         try
@@ -87,6 +86,8 @@ public class MemoryTextureParser
             };
         }
 
+        ArgumentNullException.ThrowIfNull(outputPath);
+
         // Write atlas if requested and available
         string? atlasPath = null;
         if (saveAtlas && result.AtlasData != null)
@@ -99,14 +100,16 @@ public class MemoryTextureParser
             catch (Exception ex)
             {
                 if (_verbose)
+                {
                     Console.WriteLine($"Warning: Failed to save atlas: {ex.Message}");
+                }
             }
         }
 
         // Write raw data if requested
         if (saveRaw && result.DdsData != null)
         {
-            var rawPath = Path.ChangeExtension(outputPath, ".raw");
+            string rawPath = Path.ChangeExtension(outputPath, ".raw");
             try
             {
                 File.WriteAllBytes(rawPath, result.DdsData);
@@ -114,7 +117,9 @@ public class MemoryTextureParser
             catch (Exception ex)
             {
                 if (_verbose)
+                {
                     Console.WriteLine($"Warning: Failed to save raw data: {ex.Message}");
+                }
             }
         }
 
@@ -150,7 +155,7 @@ public class MemoryTextureParser
         }
 
         // Check for DDX magic
-        var magic = BitConverter.ToUInt32(data, 0);
+        uint magic = BitConverter.ToUInt32(data, 0);
         if (magic == 0x4F445833) // "3XDO"
         {
             return ConvertDdxFromMemory(data, saveAtlas);
@@ -194,7 +199,7 @@ public class MemoryTextureParser
             reader.ReadByte(); // priorityH
 
             // Read version
-            var version = reader.ReadUInt16();
+            ushort version = reader.ReadUInt16();
             if (version < 3)
             {
                 return new ConversionResult
@@ -206,20 +211,22 @@ public class MemoryTextureParser
 
             // Read D3DTexture header (go back 1 byte, read 52 bytes)
             reader.BaseStream.Seek(-1, SeekOrigin.Current);
-            var textureHeader = reader.ReadBytes(52);
+            byte[] textureHeader = reader.ReadBytes(52);
 
             // Skip to data start (0x44)
             reader.ReadBytes(8);
 
             // Parse texture info
-            var texture = ParseD3DTextureHeader(textureHeader, out var width, out var height);
+            TextureInfo texture = ParseD3DTextureHeader(textureHeader, out int width, out int height);
 
             if (_verbose)
+            {
                 Console.WriteLine($"Memory texture: {width}x{height}, Format=0x{texture.ActualFormat:X2}");
+            }
 
             // Read remaining data
-            var remainingBytes = (int)(reader.BaseStream.Length - reader.BaseStream.Position);
-            var compressedData = reader.ReadBytes(remainingBytes);
+            int remainingBytes = (int)(reader.BaseStream.Length - reader.BaseStream.Position);
+            byte[] compressedData = reader.ReadBytes(remainingBytes);
 
             // Try to decompress
             byte[] mainData;
@@ -255,14 +262,17 @@ public class MemoryTextureParser
     /// </summary>
     private byte[] DecompressTextureData(byte[] compressed, int width, int height, uint format)
     {
-        var expectedSize = (uint)CalculateMipSize(width, height, format);
+        uint expectedSize = (uint)CalculateMipSize(width, height, format);
         var chunks = new List<byte[]>();
-        var totalConsumed = 0;
+        int totalConsumed = 0;
 
         // First chunk
-        var firstChunk = DecompressXMemCompress(compressed, expectedSize, out var consumed);
+        byte[] firstChunk = DecompressXMemCompress(compressed, expectedSize, out int consumed);
         if (_verbose)
+        {
             Console.WriteLine($"Chunk 1: {consumed} compressed -> {firstChunk.Length} decompressed");
+        }
+
         chunks.Add(firstChunk);
         totalConsumed += consumed;
 
@@ -271,15 +281,19 @@ public class MemoryTextureParser
         {
             try
             {
-                var remaining = new byte[compressed.Length - totalConsumed];
+                byte[] remaining = new byte[compressed.Length - totalConsumed];
                 Array.Copy(compressed, totalConsumed, remaining, 0, remaining.Length);
 
-                var chunk = DecompressXMemCompress(remaining, expectedSize, out consumed);
+                byte[] chunk = DecompressXMemCompress(remaining, expectedSize, out consumed);
                 if (consumed == 0 || chunk.Length == 0)
+                {
                     break;
+                }
 
                 if (_verbose)
+                {
                     Console.WriteLine($"Chunk {chunks.Count + 1}: {consumed} compressed -> {chunk.Length} decompressed");
+                }
 
                 chunks.Add(chunk);
                 totalConsumed += consumed;
@@ -291,10 +305,10 @@ public class MemoryTextureParser
         }
 
         // Combine chunks
-        var total = chunks.Sum(c => c.Length);
-        var result = new byte[total];
-        var offset = 0;
-        foreach (var chunk in chunks)
+        int total = chunks.Sum(c => c.Length);
+        byte[] result = new byte[total];
+        int offset = 0;
+        foreach (byte[] chunk in chunks)
         {
             Array.Copy(chunk, 0, result, offset, chunk.Length);
             offset += chunk.Length;
@@ -313,7 +327,7 @@ public class MemoryTextureParser
     private ConversionResult ProcessMemoryTextureData(byte[] data, int width, int height,
         TextureInfo texture, bool saveAtlas)
     {
-        var mainSurfaceSize = CalculateMipSize(width, height, texture.ActualFormat);
+        int mainSurfaceSize = CalculateMipSize(width, height, texture.ActualFormat);
 
         // Determine the layout based on data size
         if (data.Length == mainSurfaceSize)
@@ -326,8 +340,8 @@ public class MemoryTextureParser
             else
             {
                 // Simple single surface
-                var untiled = UntileTexture(data, width, height, texture.ActualFormat);
-                var dds = BuildDds(untiled, width, height, 1, texture);
+                byte[] untiled = UntileTexture(data, width, height, texture.ActualFormat);
+                byte[] dds = BuildDds(untiled, width, height, 1, texture);
                 return new ConversionResult
                 {
                     Success = true,
@@ -352,11 +366,13 @@ public class MemoryTextureParser
         {
             // Partial data - try to salvage what we can
             if (_verbose)
+            {
                 Console.WriteLine($"Partial data: {data.Length} bytes, expected {mainSurfaceSize}");
+            }
 
             // Just untile whatever we have
-            var untiled = UntileTexture(data, width, height, texture.ActualFormat);
-            var dds = BuildDds(untiled, width, height, 1, texture);
+            byte[] untiled = UntileTexture(data, width, height, texture.ActualFormat);
+            byte[] dds = BuildDds(untiled, width, height, 1, texture);
             return new ConversionResult
             {
                 Success = true,
@@ -378,7 +394,7 @@ public class MemoryTextureParser
         TextureInfo texture, bool saveAtlas)
     {
         // Untile the full atlas
-        var fullUntiled = UntileTexture(data, atlasWidth, atlasHeight, texture.ActualFormat);
+        byte[] fullUntiled = UntileTexture(data, atlasWidth, atlasHeight, texture.ActualFormat);
         byte[]? atlasData = null;
 
         if (saveAtlas)
@@ -387,27 +403,29 @@ public class MemoryTextureParser
         }
 
         // Try half-size base
-        var baseWidth = atlasWidth / 2;
-        var baseHeight = atlasHeight / 2;
+        int baseWidth = atlasWidth / 2;
+        int baseHeight = atlasHeight / 2;
 
-        var mips = ExtractPackedMips(fullUntiled, atlasWidth, atlasHeight, baseWidth, baseHeight, texture.ActualFormat);
+        List<byte[]>? mips = ExtractPackedMips(fullUntiled, atlasWidth, atlasHeight, baseWidth, baseHeight, texture.ActualFormat);
 
         if (mips != null && mips.Count >= 2)
         {
             // Success - combine mips into DDS
-            var totalSize = mips.Sum(m => m.Length);
-            var combined = new byte[totalSize];
-            var offset = 0;
-            foreach (var mip in mips)
+            int totalSize = mips.Sum(m => m.Length);
+            byte[] combined = new byte[totalSize];
+            int offset = 0;
+            foreach (byte[] mip in mips)
             {
                 Array.Copy(mip, 0, combined, offset, mip.Length);
                 offset += mip.Length;
             }
 
-            var dds = BuildDds(combined, baseWidth, baseHeight, mips.Count, texture);
+            byte[] dds = BuildDds(combined, baseWidth, baseHeight, mips.Count, texture);
 
             if (_verbose)
+            {
                 Console.WriteLine($"Extracted packed mip atlas: {baseWidth}x{baseHeight} with {mips.Count} mip levels");
+            }
 
             return new ConversionResult
             {
@@ -422,7 +440,7 @@ public class MemoryTextureParser
         }
 
         // Fallback - return as single surface at original size
-        var singleDds = BuildDds(fullUntiled, atlasWidth, atlasHeight, 1, texture);
+        byte[] singleDds = BuildDds(fullUntiled, atlasWidth, atlasHeight, 1, texture);
         return new ConversionResult
         {
             Success = true,
@@ -441,22 +459,28 @@ public class MemoryTextureParser
     private List<byte[]>? ExtractPackedMips(byte[] atlasData, int atlasWidth, int atlasHeight,
         int baseWidth, int baseHeight, uint format)
     {
-        var blockSize = GetBlockSize(format);
+        _ = GetBlockSize(format); // blockSize not directly used here but validates format
         var mips = new List<byte[]>();
 
         // Extract base mip from top-left quadrant
-        var baseMip = ExtractRegion(atlasData, atlasWidth, atlasHeight, 0, 0, baseWidth, baseHeight, format);
+        byte[]? baseMip = ExtractRegion(atlasData, atlasWidth, 0, 0, baseWidth, baseHeight, format);
         if (baseMip == null)
+        {
             return null;
+        }
 
-        var expectedBaseSize = CalculateMipSize(baseWidth, baseHeight, format);
+        int expectedBaseSize = CalculateMipSize(baseWidth, baseHeight, format);
         if (baseMip.Length != expectedBaseSize)
+        {
             return null;
+        }
 
         mips.Add(baseMip);
 
         if (_verbose)
+        {
             Console.WriteLine($"  Mip 0: {baseWidth}x{baseHeight} at (0,0), {baseMip.Length} bytes");
+        }
 
         // Extract remaining mips from right column, stacked vertically
         int mipX = baseWidth;
@@ -467,16 +491,20 @@ public class MemoryTextureParser
 
         while (mipW >= 4 && mipH >= 4 && mipX + mipW <= atlasWidth && mipY + mipH <= atlasHeight)
         {
-            var mip = ExtractRegion(atlasData, atlasWidth, atlasHeight, mipX, mipY, mipW, mipH, format);
-            var expectedSize = CalculateMipSize(mipW, mipH, format);
+            byte[]? mip = ExtractRegion(atlasData, atlasWidth, mipX, mipY, mipW, mipH, format);
+            int expectedSize = CalculateMipSize(mipW, mipH, format);
 
             if (mip == null || mip.Length != expectedSize)
+            {
                 break;
+            }
 
             mips.Add(mip);
 
             if (_verbose)
+            {
                 Console.WriteLine($"  Mip {mipLevel}: {mipW}x{mipH} at ({mipX},{mipY}), {mip.Length} bytes");
+            }
 
             mipY += mipH;
             mipW /= 2;
@@ -490,29 +518,31 @@ public class MemoryTextureParser
     /// <summary>
     /// Process texture with main surface + sequential mips.
     /// </summary>
-    private ConversionResult ProcessMainPlusMips(byte[] data, int width, int height,
+    private static ConversionResult ProcessMainPlusMips(byte[] data, int width, int height,
         TextureInfo texture, int mainSurfaceSize)
     {
         // Untile main surface
-        var mainTiled = new byte[mainSurfaceSize];
+        byte[] mainTiled = new byte[mainSurfaceSize];
         Array.Copy(data, 0, mainTiled, 0, mainSurfaceSize);
-        var mainUntiled = UntileTexture(mainTiled, width, height, texture.ActualFormat);
+        byte[] mainUntiled = UntileTexture(mainTiled, width, height, texture.ActualFormat);
 
         // Process remaining mips
         var mipDataList = new List<byte[]> { mainUntiled };
-        var mipOffset = mainSurfaceSize;
-        var mipW = width / 2;
-        var mipH = height / 2;
+        int mipOffset = mainSurfaceSize;
+        int mipW = width / 2;
+        int mipH = height / 2;
 
         while (mipW >= 4 && mipH >= 4 && mipOffset < data.Length)
         {
-            var mipSize = CalculateMipSize(mipW, mipH, texture.ActualFormat);
+            int mipSize = CalculateMipSize(mipW, mipH, texture.ActualFormat);
             if (mipOffset + mipSize > data.Length)
+            {
                 break;
+            }
 
-            var mipTiled = new byte[mipSize];
+            byte[] mipTiled = new byte[mipSize];
             Array.Copy(data, mipOffset, mipTiled, 0, mipSize);
-            var mipUntiled = UntileTexture(mipTiled, mipW, mipH, texture.ActualFormat);
+            byte[] mipUntiled = UntileTexture(mipTiled, mipW, mipH, texture.ActualFormat);
             mipDataList.Add(mipUntiled);
 
             mipOffset += mipSize;
@@ -521,16 +551,16 @@ public class MemoryTextureParser
         }
 
         // Combine all mips
-        var totalSize = mipDataList.Sum(m => m.Length);
-        var combined = new byte[totalSize];
-        var offset = 0;
-        foreach (var mip in mipDataList)
+        int totalSize = mipDataList.Sum(m => m.Length);
+        byte[] combined = new byte[totalSize];
+        int offset = 0;
+        foreach (byte[] mip in mipDataList)
         {
             Array.Copy(mip, 0, combined, offset, mip.Length);
             offset += mip.Length;
         }
 
-        var dds = BuildDds(combined, width, height, mipDataList.Count, texture);
+        byte[] dds = BuildDds(combined, width, height, mipDataList.Count, texture);
         return new ConversionResult
         {
             Success = true,
@@ -563,10 +593,10 @@ public class MemoryTextureParser
         // IMPORTANT: Xbox 360 is big-endian, so Format dwords must be read as big-endian!
 
         // Dimensions dword is at formatDword[5] position = offset 16+20 = 36, stored as BIG-ENDIAN
-        var dword5Bytes = new byte[4];
+        byte[] dword5Bytes = new byte[4];
         Array.Copy(header, 36, dword5Bytes, 0, 4);
         Array.Reverse(dword5Bytes); // Convert from big-endian to little-endian
-        var dword5 = BitConverter.ToUInt32(dword5Bytes, 0);
+        uint dword5 = BitConverter.ToUInt32(dword5Bytes, 0);
 
         // Decode size_2d structure (dimensions stored as size-1):
         // Bits 0-12: width - 1
@@ -576,23 +606,29 @@ public class MemoryTextureParser
         height = (int)(((dword5 >> 13) & 0x1FFF) + 1);
 
         // Format dwords are stored as LITTLE-ENDIAN at offset 16 within header
-        var formatDwords = new uint[6];
-        for (var i = 0; i < 6; i++)
-            formatDwords[i] = BitConverter.ToUInt32(header, 16 + i * 4);
+        uint[] formatDwords = new uint[6];
+        for (int i = 0; i < 6; i++)
+        {
+            formatDwords[i] = BitConverter.ToUInt32(header, 16 + (i * 4));
+        }
 
-        var dword3 = formatDwords[3];
-        var dword4 = formatDwords[4];
+        uint dword3 = formatDwords[3];
+        uint dword4 = formatDwords[4];
 
         // The format appears to be in DWORD[3] byte 0 (bits 0-7)
-        var dataFormat = (byte)(dword3 & 0xFF);
+        byte dataFormat = (byte)(dword3 & 0xFF);
 
         // For 0x82 textures, check DWORD[4] high byte to distinguish DXT1 from DXT5
-        var actualFormat = (byte)((dword4 >> 24) & 0xFF);
+        byte actualFormat = (byte)((dword4 >> 24) & 0xFF);
         if (actualFormat == 0)
+        {
             actualFormat = dataFormat;
+        }
 
         if (_verbose)
+        {
             Console.WriteLine($"Parsed: {width}x{height}, DataFormat=0x{dataFormat:X2}, ActualFormat=0x{actualFormat:X2}");
+        }
 
         return new TextureInfo
         {
@@ -606,27 +642,27 @@ public class MemoryTextureParser
     /// <summary>
     /// Untile/unswizzle Xbox 360 texture data.
     /// </summary>
-    private byte[] UntileTexture(byte[] src, int width, int height, uint format)
+    private static byte[] UntileTexture(byte[] src, int width, int height, uint format)
     {
-        var blockSize = GetBlockSize(format);
-        var blocksWide = width / 4;
-        var blocksHigh = height / 4;
-        var dst = new byte[src.Length];
+        int blockSize = GetBlockSize(format);
+        int blocksWide = width / 4;
+        int blocksHigh = height / 4;
+        byte[] dst = new byte[src.Length];
 
         // Calculate log2 of bytes per pixel for tiling
-        var log2Bpp = (uint)(blockSize / 4 + ((blockSize / 2) >> (blockSize / 4)));
+        uint log2Bpp = (uint)((blockSize / 4) + ((blockSize / 2) >> (blockSize / 4)));
 
-        for (var y = 0; y < blocksHigh; y++)
+        for (int y = 0; y < blocksHigh; y++)
         {
-            var inputRowOffset = TiledOffset2DRow((uint)y, (uint)blocksWide, log2Bpp);
+            uint inputRowOffset = TiledOffset2DRow((uint)y, (uint)blocksWide, log2Bpp);
 
-            for (var x = 0; x < blocksWide; x++)
+            for (int x = 0; x < blocksWide; x++)
             {
-                var inputOffset = TiledOffset2DColumn((uint)x, (uint)y, log2Bpp, inputRowOffset);
+                uint inputOffset = TiledOffset2DColumn((uint)x, (uint)y, log2Bpp, inputRowOffset);
                 inputOffset >>= (int)log2Bpp;
 
-                var dstOffset = (y * blocksWide + x) * blockSize;
-                var srcOffset = (int)inputOffset * blockSize;
+                int dstOffset = ((y * blocksWide) + x) * blockSize;
+                int srcOffset = (int)inputOffset * blockSize;
 
                 if (srcOffset + blockSize <= src.Length && dstOffset + blockSize <= dst.Length)
                 {
@@ -641,29 +677,31 @@ public class MemoryTextureParser
     /// <summary>
     /// Extract a rectangular region from untiled atlas data.
     /// </summary>
-    private byte[]? ExtractRegion(byte[] atlas, int atlasWidth, int atlasHeight,
+    private static byte[]? ExtractRegion(byte[] atlas, int atlasWidth,
         int regionX, int regionY, int regionWidth, int regionHeight, uint format)
     {
-        var blockSize = GetBlockSize(format);
-        var atlasBlocksX = atlasWidth / 4;
-        var regionBlocksX = regionWidth / 4;
-        var regionBlocksY = regionHeight / 4;
-        var startBlockX = regionX / 4;
-        var startBlockY = regionY / 4;
+        int blockSize = GetBlockSize(format);
+        int atlasBlocksX = atlasWidth / 4;
+        int regionBlocksX = regionWidth / 4;
+        int regionBlocksY = regionHeight / 4;
+        int startBlockX = regionX / 4;
+        int startBlockY = regionY / 4;
 
-        var output = new byte[regionBlocksX * regionBlocksY * blockSize];
-        var destOffset = 0;
+        byte[] output = new byte[regionBlocksX * regionBlocksY * blockSize];
+        int destOffset = 0;
 
         for (int by = 0; by < regionBlocksY; by++)
         {
-            var srcY = startBlockY + by;
+            int srcY = startBlockY + by;
             for (int bx = 0; bx < regionBlocksX; bx++)
             {
-                var srcX = startBlockX + bx;
-                var srcOffset = (srcY * atlasBlocksX + srcX) * blockSize;
+                int srcX = startBlockX + bx;
+                int srcOffset = ((srcY * atlasBlocksX) + srcX) * blockSize;
 
                 if (srcOffset + blockSize > atlas.Length)
+                {
                     return null;
+                }
 
                 Array.Copy(atlas, srcOffset, output, destOffset, blockSize);
                 destOffset += blockSize;
@@ -673,7 +711,7 @@ public class MemoryTextureParser
         return output;
     }
 
-    private int GetBlockSize(uint format)
+    private static int GetBlockSize(uint format)
     {
         return format switch
         {
@@ -682,17 +720,17 @@ public class MemoryTextureParser
         };
     }
 
-    private int CalculateMipSize(int width, int height, uint format)
+    private static int CalculateMipSize(int width, int height, uint format)
     {
-        var blockSize = GetBlockSize(format);
-        var blocksX = Math.Max(1, width / 4);
-        var blocksY = Math.Max(1, height / 4);
+        int blockSize = GetBlockSize(format);
+        int blocksX = Math.Max(1, width / 4);
+        int blocksY = Math.Max(1, height / 4);
         return blocksX * blocksY * blockSize;
     }
 
-    private int CalculateMipLevels(int width, int height)
+    private static int CalculateMipLevels(int width, int height)
     {
-        var levels = 1;
+        int levels = 1;
         while (width > 4 && height > 4)
         {
             width /= 2;
@@ -708,16 +746,16 @@ public class MemoryTextureParser
 
     private static uint TiledOffset2DRow(uint y, uint width, uint log2Bpp)
     {
-        var macro = ((y >> 5) * ((width >> 5) << (int)log2Bpp)) << 11;
-        var micro = (((y & 6) >> 1) << (int)log2Bpp) << 7;
+        uint macro = ((y >> 5) * ((width >> 5) << (int)log2Bpp)) << 11;
+        uint micro = ((y & 6) >> 1) << (int)log2Bpp << 7;
         return macro + ((micro + ((y & 8) << (7 + (int)log2Bpp))) ^ ((y & 1) << 4));
     }
 
     private static uint TiledOffset2DColumn(uint x, uint y, uint log2Bpp, uint rowOffset)
     {
-        var macro = (((x >> 5) << (int)log2Bpp) << 11);
-        var micro = (((x & 7) + ((x & 8) << 1)) << (int)log2Bpp);
-        var offset = macro + (micro ^ (((y & 8) << 3) + ((y & 1) << 4)));
+        uint macro = (x >> 5) << (int)log2Bpp << 11;
+        uint micro = ((x & 7) + ((x & 8) << 1)) << (int)log2Bpp;
+        uint offset = macro + (micro ^ (((y & 8) << 3) + ((y & 1) << 4)));
         return ((rowOffset + offset) << (int)log2Bpp) >> (int)log2Bpp;
     }
 
@@ -728,7 +766,7 @@ public class MemoryTextureParser
     /// <summary>
     /// Build a DDS file from texture data.
     /// </summary>
-    private byte[] BuildDds(byte[] data, int width, int height, int mipLevels, TextureInfo texture)
+    private static byte[] BuildDds(byte[] data, int width, int height, int mipLevels, TextureInfo texture)
     {
         using var ms = new MemoryStream();
         using var writer = new BinaryWriter(ms);
@@ -743,8 +781,8 @@ public class MemoryTextureParser
         writer.Write(width);   // dwWidth
 
         // Calculate pitch/linear size
-        var blockSize = GetBlockSize(texture.ActualFormat);
-        var linearSize = Math.Max(1, width / 4) * Math.Max(1, height / 4) * blockSize;
+        int blockSize = GetBlockSize(texture.ActualFormat);
+        int linearSize = Math.Max(1, width / 4) * Math.Max(1, height / 4) * blockSize;
         writer.Write(linearSize);  // dwPitchOrLinearSize
 
         writer.Write(0);  // dwDepth
@@ -752,14 +790,16 @@ public class MemoryTextureParser
 
         // dwReserved1[11]
         for (int i = 0; i < 11; i++)
+        {
             writer.Write(0);
+        }
 
         // DDS_PIXELFORMAT (32 bytes)
         writer.Write(32);  // dwSize
         writer.Write(4);   // dwFlags = DDPF_FOURCC
 
         // FourCC based on format
-        var fourCC = GetFourCC(texture.ActualFormat);
+        uint fourCC = GetFourCC(texture.ActualFormat);
         writer.Write(fourCC);
 
         writer.Write(0);  // dwRGBBitCount
@@ -769,9 +809,12 @@ public class MemoryTextureParser
         writer.Write(0);  // dwABitMask
 
         // dwCaps
-        var caps = 0x1000;  // DDSCAPS_TEXTURE
+        int caps = 0x1000;  // DDSCAPS_TEXTURE
         if (mipLevels > 1)
+        {
             caps |= 0x400008;  // DDSCAPS_COMPLEX | DDSCAPS_MIPMAP
+        }
+
         writer.Write(caps);
 
         writer.Write(0);  // dwCaps2
@@ -785,7 +828,7 @@ public class MemoryTextureParser
         return ms.ToArray();
     }
 
-    private uint GetFourCC(uint format)
+    private static uint GetFourCC(uint format)
     {
         return format switch
         {
@@ -801,23 +844,25 @@ public class MemoryTextureParser
 
     #region XMemCompress
 
-    private byte[] DecompressXMemCompress(byte[] compressed, uint expectedSize, out int bytesConsumed)
+    private static byte[] DecompressXMemCompress(byte[] compressed, uint expectedSize, out int bytesConsumed)
     {
-        var buffer = new byte[expectedSize * 2];
+        byte[] buffer = new byte[expectedSize * 2];
 
         using var context = new XCompression.DecompressionContext();
-        var compressedLen = compressed.Length;
-        var decompressedLen = buffer.Length;
+        int compressedLen = compressed.Length;
+        int decompressedLen = buffer.Length;
 
-        var result = context.Decompress(
+        ErrorCode result = context.Decompress(
             compressed, 0, ref compressedLen,
             buffer, 0, ref decompressedLen);
 
         if (result != XCompression.ErrorCode.None)
+        {
             throw new InvalidOperationException($"XMemCompress decompression failed: {result}");
+        }
 
         bytesConsumed = compressedLen;
-        var output = new byte[decompressedLen];
+        byte[] output = new byte[decompressedLen];
         Array.Copy(buffer, output, decompressedLen);
         return output;
     }
