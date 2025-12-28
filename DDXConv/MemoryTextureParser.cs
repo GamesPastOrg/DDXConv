@@ -678,13 +678,13 @@ public class MemoryTextureParser
     private static uint TiledOffset2DRow(uint y, uint width, uint log2Bpp)
     {
         var macro = ((y >> 5) * ((width >> 5) << (int)log2Bpp)) << 11;
-        var micro = ((y & 6) >> 1) << (int)log2Bpp << 7;
+        var micro = (((y & 6) >> 1) << (int)log2Bpp) << 7;
         return macro + ((micro + ((y & 8) << (7 + (int)log2Bpp))) ^ ((y & 1) << 4));
     }
 
     private static uint TiledOffset2DColumn(uint x, uint y, uint log2Bpp, uint rowOffset)
     {
-        var macro = (x >> 5) << (int)log2Bpp << 11;
+        var macro = ((x >> 5) << (int)log2Bpp) << 11;
         var micro = ((x & 7) + ((x & 8) << 1)) << (int)log2Bpp;
         var offset = macro + (micro ^ (((y & 8) << 3) + ((y & 1) << 4)));
         return ((rowOffset + offset) << (int)log2Bpp) >> (int)log2Bpp;
