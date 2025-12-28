@@ -2,18 +2,25 @@ namespace DDXConv;
 
 /// <summary>
 ///     Writes DDS (DirectDraw Surface) files.
+///     DDS is the standard texture format used for DirectX games.
 /// </summary>
 public static class DdsWriter
 {
     // DDS file constants
     private const uint DDS_MAGIC = 0x20534444; // "DDS "
+    
+    // DDS header flags (DDSD_*
     private const uint DDSD_CAPS = 0x1;
     private const uint DDSD_HEIGHT = 0x2;
     private const uint DDSD_WIDTH = 0x4;
     private const uint DDSD_PIXELFORMAT = 0x1000;
     private const uint DDSD_MIPMAPCOUNT = 0x20000;
     private const uint DDSD_LINEARSIZE = 0x80000;
+    
+    // DDS pixel format flags
     private const uint DDPF_FOURCC = 0x4;
+    
+    // DDS caps flags (DDSCAPS_*
     private const uint DDSCAPS_TEXTURE = 0x1000;
     private const uint DDSCAPS_MIPMAP = 0x400000;
     private const uint DDSCAPS_COMPLEX = 0x8;

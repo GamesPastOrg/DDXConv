@@ -11,6 +11,10 @@ public static class TextureUtilities
     /// <summary>
     ///     Get the DDS FourCC code for a given Xbox 360 GPU texture format.
     /// </summary>
+    /// <remarks>
+    ///     Maps Xbox 360 GPU texture formats to D3D formats.
+    ///     For 0x82 base format, the actual format is determined by DWORD[4] of the texture header.
+    /// </remarks>
     public static uint GetDxgiFormat(uint gpuFormat)
     {
         return gpuFormat switch
@@ -35,13 +39,17 @@ public static class TextureUtilities
     /// <summary>
     ///     Get the DXT block size in bytes for a given format.
     /// </summary>
+    /// <remarks>
+    ///     DXT1/ATI1/BC4 formats use 8 bytes per 4x4 block.
+    ///     DXT3/DXT5/ATI2/BC5 formats use 16 bytes per 4x4 block.
+    /// </remarks>
     public static int GetBlockSize(uint format)
     {
         return format switch
         {
-            // DXT1
+            // DXT1, ATI1/BC4 (single channel, same block size as DXT1)
             0x52 or 0x7B or 0x82 or 0x86 or 0x12 => 8,
-            // DXT3
+            // DXT3, DXT5, ATI2/BC5 (normal maps), and variants
             _ => 16
         };
     }
@@ -84,13 +92,20 @@ public static class TextureUtilities
     /// <summary>
     ///     Calculate byte size for a single mip level.
     /// </summary>
+    /// <remarks>
+    ///     Format size mappings:
+    ///     - 0x52, 0x7B, 0x82, 0x86, 0x12: DXT1/ATI1 - 8 bytes per 4x4 block
+    ///     - 0x53, 0x54, 0x71, 0x88, 0x13, 0x14: DXT3/DXT5/ATI2 - 16 bytes per 4x4 block
+    ///     - 0x06: A8R8G8B8 - 32 bits per pixel
+    ///     - 0x04: R5G6B5 - 16 bits per pixel
+    /// </remarks>
     public static uint CalculateMipSize(uint width, uint height, uint format)
     {
         return format switch
         {
-            // DXT1
+            // DXT1, ATI1/BC4 (single channel, same block size as DXT1)
             0x52 or 0x7B or 0x82 or 0x86 or 0x12 => Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 8,
-            // DXT3
+            // DXT3, DXT5, DXT5 variant (normal maps), and GPUTEXTUREFORMAT variants
             0x53 or 0x54 or 0x71 or 0x88 or 0x13 or 0x14 => Math.Max(1, (width + 3) / 4) *
                                                             Math.Max(1, (height + 3) / 4) * 16,
             // A8R8G8B8 - 32 bits per pixel
@@ -165,6 +180,13 @@ public static class TextureUtilities
     ///     Unswizzle/untile Xbox 360 DXT texture data.
     ///     Xbox 360 uses Morton order (Z-order curve) tiling for textures.
     /// </summary>
+    /// <remarks>
+    ///     Xbox 360 tiling algorithm derived from Xenia emulator.
+    ///     See: https://github.com/xenia-project/xenia/blob/master/src/xenia/gpu/texture_conversion.cc
+    ///     
+    ///     The log2Bpp calculation: blockSize / 4 + ((blockSize / 2) >> (blockSize / 4))
+    ///     gives the bytes-per-pixel log2 value used in the tiling offset calculations.
+    /// </remarks>
     public static byte[] UnswizzleDXTTexture(byte[] src, int width, int height, uint format)
     {
         ArgumentNullException.ThrowIfNull(src);
@@ -213,6 +235,10 @@ public static class TextureUtilities
     /// <summary>
     ///     Calculate tiled row offset for Xbox 360 texture.
     /// </summary>
+    /// <remarks>
+    ///     Xbox 360 tiling function from Xenia emulator.
+    ///     See: https://github.com/xenia-project/xenia/blob/master/src/xenia/gpu/texture_conversion.cc
+    /// </remarks>
     public static uint TiledOffset2DRow(uint y, uint width, uint log2Bpp)
     {
         var macro = ((y >> 5) * ((width >> 5) << (int)log2Bpp)) << 11;
@@ -223,6 +249,10 @@ public static class TextureUtilities
     /// <summary>
     ///     Calculate tiled column offset for Xbox 360 texture.
     /// </summary>
+    /// <remarks>
+    ///     Xbox 360 tiling function from Xenia emulator.
+    ///     See: https://github.com/xenia-project/xenia/blob/master/src/xenia/gpu/texture_conversion.cc
+    /// </remarks>
     public static uint TiledOffset2DColumn(uint x, uint y, uint log2Bpp, uint baseOffset)
     {
         var macro = (x >> 5) << (int)log2Bpp << 11;
