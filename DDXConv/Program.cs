@@ -64,10 +64,12 @@ if (Directory.Exists(inputPath))
     var ddxFiles = Directory.GetFiles(inputPath, "*.ddx", SearchOption.AllDirectories);
 
     var errors = 0;
-    var failed = new List<(string name, string error)>();
+    var successes = 0;
+    var failed = new Dictionary<string, List<string>>();
     var invalids = 0;
 
-    foreach (var ddxFile in ddxFiles)
+    //foreach (var ddxFile in ddxFiles)
+    Parallel.ForEach(ddxFiles, ddxFile =>
     {
         var relativePath = Path.GetRelativePath(inputPath, ddxFile);
         var outputBatchPath = Path.Combine(outputDir, Path.ChangeExtension(relativePath, ".dds"));
@@ -84,15 +86,20 @@ if (Directory.Exists(inputPath))
 
                 if (result.Success)
                 {
-                    Console.WriteLine($"Converted {ddxFile} to {outputBatchPath}");
+                    successes++;
+                    if (verbose) Console.WriteLine($"Converted {ddxFile} to {outputBatchPath}");
                 }
                 else
                 {
                     errors++;
-                    Console.WriteLine($"Error converting {ddxFile}: {result.Error}");
-                    failed.Add((ddxFile, result.Error ?? "Unknown error"));
-                    continue;
+                    if (verbose) Console.WriteLine($"Error converting {ddxFile}: {result.Error}");
+                    var error = result.Error ?? "Unknown error";
+                    if (!failed.ContainsKey(error))
+                        failed[error] = new List<string>();
+                    failed[error].Add(ddxFile);
+                    return;
                 }
+                if (!verbose) Console.Write($"\rConverted {successes} / {ddxFiles.Length} files, {errors} failed...");
             }
             else
             {
@@ -108,7 +115,8 @@ if (Directory.Exists(inputPath))
                         NoUntile = noUntile,
                         SkipEndianSwap = skipEndianSwap
                     });
-                Console.WriteLine($"Converted {ddxFile} to {outputBatchPath}");
+                successes++;
+                if (verbose) Console.WriteLine($"Converted {ddxFile} to {outputBatchPath}");
             }
 
             if (regenMips) DdsPostProcessor.RegenerateMips(outputBatchPath);
@@ -120,20 +128,21 @@ if (Directory.Exists(inputPath))
         catch (Exception ex)
         {
             errors++;
-            Console.WriteLine($"Error converting {ddxFile}: {ex.Message}");
-            failed.Add((ddxFile, ex.Message));
+            if (verbose) Console.WriteLine($"Error converting {ddxFile}: {ex.Message}");
+            if (!failed.ContainsKey(ex.Message))
+                failed[ex.Message] = new List<string>();
+            failed[ex.Message].Add(ddxFile);
         }
-    }
-
-    Console.WriteLine(
-        $"Batch conversion completed. Successfully converted {ddxFiles.Length - errors - invalids} out of {ddxFiles.Length} files ({errors} failures, {invalids} unsupported).");
-    foreach (var (name, error) in failed) Console.Write($"- {name}: {error}\n");
+        
+        if (!verbose) Console.Write($"\rConverted {successes} / {ddxFiles.Length} files, {errors} failed, {invalids} unsupported...");
+    });
 
     if (pcFriendly)
     {
         // cycle through output directory and process normal + specular maps
         var ddsFiles = Directory.GetFiles(outputDir, "*_n.dds", SearchOption.AllDirectories);
-        foreach (var ddsFile in ddsFiles)
+        //foreach (var ddsFile in ddsFiles)
+        Parallel.ForEach(ddsFiles, ddsFile =>
         {
             // check if file with same name but _s.dds exists
             var specFile = ddsFile.Replace("_n.dds", "_s.dds", StringComparison.Ordinal);
@@ -146,7 +155,18 @@ if (Directory.Exists(inputPath))
             {
                 Console.WriteLine($"Error converting to PC-friendly normal map {ddsFile}: {ex.Message}");
             }
-        }
+        });
+    }
+    
+    Console.WriteLine(
+        $"\nBatch conversion completed. Successfully converted {ddxFiles.Length - errors - invalids} out of {ddxFiles.Length} files ({errors} failures, {invalids} unsupported).");
+    foreach (var kvp in failed)
+    {
+        Console.WriteLine($"Error: {kvp.Key}");
+        for (var i = 0; i < Math.Min(kvp.Value.Count, 16); i++)
+            Console.WriteLine($"  {kvp.Value[i]}");
+        if (kvp.Value.Count > 16)
+            Console.WriteLine($"  ...and {kvp.Value.Count - 16} more.");
     }
 
     return;

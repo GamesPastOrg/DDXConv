@@ -19,19 +19,25 @@ You are expected to extract ddx files from bsa archives yourself. Support will n
 ```            
 Single File: DDXConv <input_file> [output_file] [options]
       Batch: DDXConv <input_directory> <output_directory> [options]
+      
 Standard Options:
   --pc-friendly, -pc   Produce PC-ready normal maps (batch conversion only!)
   --regen-mips, -g     Regenerate mip levels from top level
+  
+Memory Dump Options (for textures carved from memory dumps):
+  --memory, -m         Use memory texture parser (handles memory dump layouts)
+  --atlas, -a          Save full untiled atlas as separate DDS file
+  
 Developer Options:
-  --atlas, -a          Save untiled mip atlas as separate DDS file
   --raw, -r            Save raw combined decompressed data as binary file
   --save-mips          Save extracted mip levels from atlas
   --no-untile-atlas    Do not untile/unswizzle the atlas (leave tiled)
+  --no-untile          Do not untile/unswizzle ANY data (for debugging)
   --no-swap            Do not perform endian swap on data
   --verbose, -v        Enable verbose output
 ```
 
-Requires [XNA Framework Redistributable](https://www.microsoft.com/en-us/download/details.aspx?id=20914) and [.NET 9.0 Runtime (x86)](https://dotnet.microsoft.com/en-us/download/dotnet/9.0) to run.
+Requires [XNA Framework Redistributable](https://www.microsoft.com/en-us/download/details.aspx?id=20914) and [.NET 10.0 Runtime (x86)](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) to run.
 
 ---
 
@@ -39,6 +45,7 @@ Requires [XNA Framework Redistributable](https://www.microsoft.com/en-us/downloa
 Untiling code based on [xenia](https://github.com/xenia-project/xenia)
 <br>Decompression handled via [XCompression](https://github.com/gibbed/XCompression) (thanks MrPinball64 for the pointer!)
 <br>Special thanks to everyone in the TriangleCity Discord for their accompaniment while I worked on this.
+<br>Thanks to [slfx77](https://github.com/slfx77) for their work cleaning up some of my code
 
 ---
 
