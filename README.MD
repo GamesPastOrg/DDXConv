@@ -8,7 +8,6 @@ Current status (numbers from July 2010 proto): Converts *most* textures correctl
 Known Issues:
 - Some textures appear to have issues with their mipmaps, I have made an effort to extract them properly, but an option to regenerate mips is included (`-g` or `--regen-mips`) so you can reliably get good data.
 - 13 3XDO files fail to convert for one reason or another. This seems to be related to them having a low resolution in at least one axis (8px or lower)
-- 3XDR format textures are not supported. This affects 3961 textures.
 
 Pull requests and issues are welcome to address these issues or any other bugs you may find.
 
@@ -19,15 +18,19 @@ You are expected to extract ddx files from bsa archives yourself. Support will n
 ```            
 Single File: DDXConv <input_file> [output_file] [options]
       Batch: DDXConv <input_directory> <output_directory> [options]
-      
+
 Standard Options:
   --pc-friendly, -pc   Produce PC-ready normal maps (batch conversion only!)
   --regen-mips, -g     Regenerate mip levels from top level
-  
+
 Memory Dump Options (for textures carved from memory dumps):
   --memory, -m         Use memory texture parser (handles memory dump layouts)
   --atlas, -a          Save full untiled atlas as separate DDS file
-  
+
+GUI Integration Options:
+  --progress, -p       Output machine-parseable progress (batch mode only)
+                       Format: [PROGRESS] STATUS <path> [error]
+
 Developer Options:
   --raw, -r            Save raw combined decompressed data as binary file
   --save-mips          Save extracted mip levels from atlas
@@ -45,11 +48,11 @@ Requires [XNA Framework Redistributable](https://www.microsoft.com/en-us/downloa
 Untiling code based on [xenia](https://github.com/xenia-project/xenia)
 <br>Decompression handled via [XCompression](https://github.com/gibbed/XCompression) (thanks MrPinball64 for the pointer!)
 <br>Special thanks to everyone in the TriangleCity Discord for their accompaniment while I worked on this.
-<br>Thanks to [slfx77](https://github.com/slfx77) for their work cleaning up some of my code
+<br>Thanks to [slfx77](https://github.com/slfx77) for their work cleaning up some of my code and fixing 3XDR conversion
 
 ---
 
 ### Other Tools for New Vegas Prototypes
+- [Memory Dump Scanner & Nif Converter](https://github.com/slfx77/xbox-360-minidump-extractor)
 - [Save Image Extractor](https://github.com/GamesPastOrg/Fallout_Save_Image_Extractor)
-- [Memory Dump Scanner](https://github.com/slfx77/xbox-360-minidump-extractor)
 - [Xenia Patches](https://github.com/GamesPastOrg/FalloutForXenia)
