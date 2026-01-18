@@ -2,6 +2,30 @@ using XCompression;
 
 namespace DDXConv;
 
+/// <summary>
+///     Parameters for extracting a region from an atlas.
+/// </summary>
+internal readonly record struct AtlasRegionParams(
+    int AtlasWidth,
+    int AtlasHeight,
+    int RegionX,
+    int RegionY,
+    int RegionWidth,
+    int RegionHeight,
+    uint Format);
+
+/// <summary>
+///     Parameters for unpacking a mip atlas.
+/// </summary>
+internal readonly record struct MipAtlasParams(
+    int AtlasWidth,
+    int AtlasHeight,
+    uint Format,
+    int MainWidth,
+    int MainHeight,
+    string? OutputPath = null,
+    bool SaveMips = false);
+
 public class DdxParser(bool verbose = false)
 {
     private const uint MAGIC_3XDO = 0x4F445833;
@@ -43,7 +67,12 @@ public class DdxParser(bool verbose = false)
         using var reader = new BinaryReader(File.OpenRead(inputPath));
         var magic = reader.ReadUInt32();
 
-        if (magic == MAGIC_3XDR) throw new NotSupportedException("3XDR format files do not yet convert properly.");
+        if (magic == MAGIC_3XDR)
+        {
+            // 3XDR is simpler than 3XDO: linear layout, mip0 only, just needs byte swap
+            Convert3XdrToDds(reader, outputPath, options);
+            return;
+        }
 
         if (magic != MAGIC_3XDO) throw new InvalidDataException($"Unknown DDX magic: 0x{magic:X8}.");
 
@@ -52,14 +81,186 @@ public class DdxParser(bool verbose = false)
         ConvertDdxToDds(reader, outputPath, options, magic);
     }
 
+    /// <summary>
+    ///     Convert 3XDR (engine-tiled) format to DDS.
+    ///     3XDR is simpler than 3XDO:
+    ///     - Data is already linear (NOT Morton-swizzled)
+    ///     - Contains only mip0 (no mip atlas)
+    ///     - Only requires decompression + 16-bit byte swap for Xbox 360 big-endian
+    /// </summary>
+    private void Convert3XdrToDds(BinaryReader reader, string outputPath, ConversionOptions options)
+    {
+        _currentOptions = options;
+
+        // Read header (same as 3XDO up to offset 0x44)
+        _ = reader.ReadByte(); // priorityL
+        _ = reader.ReadByte(); // priorityC
+        _ = reader.ReadByte(); // priorityH
+        var version = reader.ReadUInt16();
+
+        if (version < 3)
+            throw new NotSupportedException($"3XDR version {version} is not supported. Need version >= 3");
+
+        // Read D3DTexture header (52 bytes from 0x08 to 0x3C)
+        reader.BaseStream.Seek(-1, SeekOrigin.Current);
+        var textureHeader = reader.ReadBytes(52);
+        reader.ReadBytes(8); // Skip to 0x44
+
+        var texture = ParseD3DTextureHeaderWithDimensions(textureHeader, out var width, out var height);
+
+        if (_verboseLogging)
+            Console.WriteLine($"3XDR: {width}x{height}, Format=0x{texture.ActualFormat:X2}");
+
+        // Read all remaining compressed data
+        var currentPos = reader.BaseStream.Position;
+        var fileSize = reader.BaseStream.Length;
+        var compressedData = reader.ReadBytes((int)(fileSize - currentPos));
+
+        // Decompress - 3XDR has mip chain in linear layout
+        var mip0Size = (uint)TextureUtilities.CalculateMipSize(width, height, texture.ActualFormat);
+        var decompressed = DecompressXMemCompress(compressedData, mip0Size, out var consumed);
+
+        if (_verboseLogging)
+            Console.WriteLine(
+                $"3XDR: Decompressed {consumed} bytes to {decompressed.Length} bytes (expected mip0={mip0Size})");
+
+        // 3XDR data uses Xbox 360 2×2 macro block tiling and big-endian byte order
+        // Step 1: Untile from 2×2 macro blocks to linear row-major layout
+        // Step 2: Swap every 16-bit word for PC little-endian
+        var blockSize = TextureUtilities.GetBlockSize(texture.ActualFormat);
+        var untiled = Untile2x2MacroBlocks(decompressed, width, height, blockSize);
+        var textureData = SwapEvery16Bits(untiled);
+
+        // 3XDR files contain only mip0 - no mip chain
+        var mipLevels = 1;
+
+        // Update texture info
+        texture.Width = width;
+        texture.Height = height;
+        texture.MipLevels = (byte)mipLevels;
+
+        // Write DDS file
+        WriteDdsFile(outputPath, texture, textureData);
+
+        if (_verboseLogging)
+            Console.WriteLine($"3XDR: Saved DDS to {outputPath} ({textureData.Length} bytes, {mipLevels} mip(s))");
+    }
+
+    /// <summary>
+    ///     Swap every 16-bit word in the data (Xbox 360 to PC endian conversion).
+    /// </summary>
+    private static byte[] SwapEvery16Bits(byte[] src)
+    {
+        var dst = new byte[src.Length];
+        for (var i = 0; i < src.Length - 1; i += 2)
+        {
+            dst[i] = src[i + 1];
+            dst[i + 1] = src[i];
+        }
+
+        // Handle odd byte at end if present
+        if ((src.Length & 1) == 1) dst[src.Length - 1] = src[src.Length - 1];
+
+        return dst;
+    }
+
+    /// <summary>
+    ///     Untile 3XDR blocks from Xbox 360 format to linear PC layout.
+    ///     The 3XDR tiling pattern discovered through block mapping analysis:
+    ///     Within 8×2 block groups, the Xbox layout maps to PC as follows:
+    ///     Xbox row 0 (Y=0 within group):
+    ///     Xbox X: 0  1  2  3  4  5  6  7
+    ///     PC X:   0  1  0  1  2  3  2  3
+    ///     PC Y:   0  0  1  1  0  0  1  1
+    ///     Xbox row 1 (Y=1 within group):
+    ///     Xbox X: 0  1  2  3  4  5  6  7
+    ///     PC X:   4  5  4  5  6  7  6  7
+    ///     PC Y:   0  0  1  1  0  0  1  1
+    ///     Pattern: blocks are interleaved in 2×2 chunks across 8 columns
+    /// </summary>
+    private static byte[] Untile2x2MacroBlocks(byte[] src, int width, int height, int blockSize)
+    {
+        var blocksX = Math.Max(1, (width + 3) / 4);
+        var blocksY = Math.Max(1, (height + 3) / 4);
+        var mipSize = blocksX * blocksY * blockSize;
+
+        var dst = new byte[mipSize];
+
+        // For very small textures (< 8 blocks in X or < 2 in Y), no tiling needed
+        if (blocksY < 2 || blocksX < 8)
+        {
+            Array.Copy(src, dst, Math.Min(src.Length, mipSize));
+            return dst;
+        }
+
+        // Process each Xbox block and place it in the correct PC position
+        for (var xboxIdx = 0; xboxIdx < blocksX * blocksY; xboxIdx++)
+        {
+            var xboxX = xboxIdx % blocksX;
+            var xboxY = xboxIdx / blocksX;
+
+            // Calculate PC position based on discovered mapping
+            var pcIdx = GetPcBlockIndex(xboxX, xboxY, blocksX);
+
+            var srcOffset = xboxIdx * blockSize;
+            var dstOffset = pcIdx * blockSize;
+
+            if (srcOffset + blockSize <= src.Length && dstOffset + blockSize <= dst.Length)
+                Array.Copy(src, srcOffset, dst, dstOffset, blockSize);
+        }
+
+        return dst;
+    }
+
+    /// <summary>
+    ///     Calculate PC block index from Xbox block position.
+    ///     Based on empirical mapping analysis from block-by-block comparison.
+    ///     The tiling operates on 8×2 block groups with this transformation:
+    ///     Xbox row 0 (Y=0 within group):
+    ///     Xbox X: 0  1  2  3  4  5  6  7
+    ///     PC X:   0  1  0  1  2  3  2  3
+    ///     PC Y:   0  0  1  1  0  0  1  1
+    ///     Xbox row 1 (Y=1 within group):
+    ///     Xbox X: 0  1  2  3  4  5  6  7
+    ///     PC X:   4  5  4  5  6  7  6  7
+    ///     PC Y:   0  0  1  1  0  0  1  1
+    ///     Formula:
+    ///     pcLocalX = localY * 4 + (localX / 4) * 2 + (localX % 2)
+    ///     pcLocalY = (localX / 2) % 2
+    ///     This is a small bit permutation (bit swizzle) within the 8x2 group.
+    /// </summary>
+    private static int GetPcBlockIndex(int xboxX, int xboxY, int blocksX)
+    {
+        // Determine which 8×2 group this block belongs to
+        var groupX = xboxX / 8;
+        var groupY = xboxY / 2;
+
+        // Position within the 8×2 group
+        var localX = xboxX % 8;
+        var localY = xboxY % 2;
+
+        // Apply the transformation formula derived from block mapping analysis.
+        // Equivalent form:
+        // pcLocalX = localY * 4 + (localX / 4) * 2 + (localX % 2)
+        // pcLocalY = (localX / 2) % 2
+        var pcLocalX = (localY << 2) | ((localX >> 2) << 1) | (localX & 1);
+        var pcLocalY = (localX >> 1) & 1;
+
+        // Convert back to absolute PC coordinates
+        var pcX = groupX * 8 + pcLocalX;
+        var pcY = groupY * 2 + pcLocalY;
+
+        return pcY * blocksX + pcX;
+    }
+
     // Some of this code build from analyzing NiXenonSourceTextureData::CreateFromDDXFile, some from file analysis
     private void ConvertDdxToDds(BinaryReader reader, string outputPath, ConversionOptions options, uint magic)
     {
         _currentOptions = options;
 
-        var priorityL = reader.ReadByte();
-        var priorityC = reader.ReadByte();
-        var priorityH = reader.ReadByte();
+        _ = reader.ReadByte(); // priorityL
+        _ = reader.ReadByte(); // priorityC
+        _ = reader.ReadByte(); // priorityH
 
         // Read version
         var version = reader.ReadUInt16();
@@ -93,9 +294,7 @@ public class DdxParser(bool verbose = false)
 
         // Calculate total expected size: atlas (2x resolution) + linear mips
         // Use ActualFormat instead of DataFormat for correct size calculation
-        var atlasSize = (uint)CalculateMipSize(width, height, texture.ActualFormat);
-        var linearDataSize =
-            CalculateMainDataSize(width, height, texture.ActualFormat, CalculateMipLevels(width, height));
+        var atlasSize = (uint)TextureUtilities.CalculateMipSize(width, height, texture.ActualFormat);
 
         // Decompress all chunks in sequence
         var compressedData = mainData;
@@ -171,27 +370,39 @@ public class DdxParser(bool verbose = false)
         }
 
         // Calculate expected main surface size with detected dimensions
-        var mainSurfaceSize = (uint)CalculateMipSize(width, height, texture.ActualFormat);
+        var mainSurfaceSize = (uint)TextureUtilities.CalculateMipSize(width, height, texture.ActualFormat);
 
         byte[] linearData = [];
 
         // Check if we have two chunks or one chunk
         // Two chunk format can be:
-        // 1. Exactly 2x atlasSize (for small textures like 128x128 or 256x256)
+        // 1. Exactly 2 decompressed chunks (use actual decompressed boundaries)
         // 2. Main surface + smaller mip atlas (for large textures like 1024x1024)
         var isTwoChunkFormat = false;
         uint chunk1Size = 0;
         uint chunk2Size = 0;
 
-        if (mainData.Length == atlasSize * 2)
+        // When we have exactly 2 decompressed chunks, use their actual sizes
+        // This is important because Xbox 360 tiling may pad textures (e.g., 128x64 stored as 128x128)
+        if (decompressedChunks.Count == 2)
         {
-            // Small texture: two equal-sized chunks
+            isTwoChunkFormat = true;
+            chunk1Size = (uint)decompressedChunks[0].Length;
+            chunk2Size = (uint)decompressedChunks[1].Length;
+            if (_verboseLogging)
+                Console.WriteLine(
+                    $"Using actual decompressed chunk boundaries: chunk1={chunk1Size}, chunk2={chunk2Size}");
+        }
+        else if (decompressedChunks.Count > 1 && mainData.Length == atlasSize * 2)
+        {
+            // Small texture: two equal-sized chunks (only if we actually have multiple chunks)
             isTwoChunkFormat = true;
             chunk1Size = atlasSize;
             chunk2Size = atlasSize;
         }
-        else if (mainData.Length > mainSurfaceSize)
+        else if (decompressedChunks.Count > 1 && mainData.Length > mainSurfaceSize)
         {
+            // Only treat as two-chunk format if we actually decompressed multiple chunks
             var remainingSize = mainData.Length - (int)mainSurfaceSize;
 
             isTwoChunkFormat = true;
@@ -272,7 +483,6 @@ public class DdxParser(bool verbose = false)
             {
                 // Large texture: calculate atlas dimensions from actual chunk1 size
                 // The atlas contains mips, determine dimensions by reverse-calculating from size
-                var blocksInAtlas = (int)chunk1Size / blockSize;
 
                 // For non-square textures, atlas width is typically 5/8 of main width
                 // For square textures, atlas is same dimensions as main
@@ -344,18 +554,25 @@ public class DdxParser(bool verbose = false)
             }
 
             // Extract mips from atlas
-            var mips = UnpackMipAtlas(untiledAtlas, atlasWidth, atlasHeight, texture.ActualFormat,
-                (int)texture.Width,
-                (int)texture.Height, outputPath, options?.SaveMips ?? false);
+            var mips = UnpackMipAtlas(untiledAtlas, new MipAtlasParams(
+                atlasWidth, atlasHeight, texture.ActualFormat,
+                (int)texture.Width, (int)texture.Height,
+                outputPath, options?.SaveMips ?? false));
             if (_verboseLogging) Console.WriteLine($"Extracted {mips.Length} bytes of mips from atlas");
 
-            linearData = new byte[untiledMain.Length + mips.Length];
-            Array.Copy(untiledMain, 0, linearData, 0, untiledMain.Length);
-            Array.Copy(mips, 0, linearData, untiledMain.Length, mips.Length);
+            // Crop main surface to actual texture size (Xbox 360 often pads to power-of-2)
+            var actualMainSize = TextureUtilities.CalculateMipSize(width, height, texture.ActualFormat);
+            var croppedMain = untiledMain.Length > actualMainSize
+                ? untiledMain[..actualMainSize]
+                : untiledMain;
+
+            linearData = new byte[croppedMain.Length + mips.Length];
+            Array.Copy(croppedMain, 0, linearData, 0, croppedMain.Length);
+            Array.Copy(mips, 0, linearData, croppedMain.Length, mips.Length);
 
             if (_verboseLogging)
                 Console.WriteLine(
-                    $"Combined {untiledMain.Length} bytes main surface + {mips.Length} bytes mips = {linearData.Length} total");
+                    $"Combined {croppedMain.Length} bytes main surface + {mips.Length} bytes mips = {linearData.Length} total");
         }
         else
         {
@@ -368,7 +585,7 @@ public class DdxParser(bool verbose = false)
             // E.g., header says 512x256 but data is actually 2x 256x256
             // This pattern is only used for format 0x71 (normal maps with mip atlas)
             var halfSize = mainData.Length / 2;
-            var squareSize = (int)Math.Sqrt(halfSize / 16) * 4;
+            var squareSize = (int)Math.Sqrt((double)halfSize / 16) * 4;
             var couldBeTwoSquares = texture.ActualFormat == 0x71 &&
                                     squareSize * squareSize / 16 * 16 == halfSize &&
                                     width == squareSize * 2 && height == squareSize;
@@ -404,7 +621,7 @@ public class DdxParser(bool verbose = false)
 
                     while (mipWidth >= 4 && mipHeight >= 4 && processedMipData < remainingSize)
                     {
-                        var mipSize = CalculateMipSize(mipWidth, mipHeight, texture.ActualFormat);
+                        var mipSize = TextureUtilities.CalculateMipSize(mipWidth, mipHeight, texture.ActualFormat);
                         if (processedMipData + mipSize > remainingSize) break;
 
                         processedMipData += mipSize;
@@ -424,7 +641,7 @@ public class DdxParser(bool verbose = false)
                     mipHeight = height / 2;
                     for (var i = 1; i < mipLevels; i++)
                     {
-                        var mipSize = CalculateMipSize(mipWidth, mipHeight, texture.ActualFormat);
+                        var mipSize = TextureUtilities.CalculateMipSize(mipWidth, mipHeight, texture.ActualFormat);
                         var mipTiled = new byte[mipSize];
                         Array.Copy(remainingData, mipOffset, mipTiled, 0, mipSize);
                         var mipUntiled = UnswizzleDXTTexture(mipTiled, mipWidth, mipHeight, texture.ActualFormat);
@@ -447,6 +664,54 @@ public class DdxParser(bool verbose = false)
                     texture.MipLevels = (byte)mipLevels;
                     if (_verboseLogging) Console.WriteLine($"Set MipLevels to {texture.MipLevels}");
                 }
+                else if (decompressedChunks.Count == 1 && mainData.Length == mainSurfaceSize * 2)
+                {
+                    // Single chunk with exactly 2× main surface size - this is main + mip atlas
+                    // The first half (mainSurfaceSize bytes) is the main surface
+                    var mainSurfaceBytes = (int)mainSurfaceSize;
+
+                    if (_verboseLogging)
+                        Console.WriteLine("Single chunk with 2x main surface - extracting first half as main");
+
+                    // Extract main surface portion and untile it
+                    var mainSurfaceData = mainData[..mainSurfaceBytes];
+                    var processedMain = UnswizzleDXTTexture(mainSurfaceData, width, height, texture.ActualFormat);
+
+                    // Extract atlas portion and untile it
+                    var atlasData = mainData[mainSurfaceBytes..];
+                    var processedAtlas = UnswizzleDXTTexture(atlasData, width, height, texture.ActualFormat);
+
+                    if (_verboseLogging)
+                        Console.WriteLine(
+                            $"Processed main: {processedMain.Length} bytes, atlas: {processedAtlas.Length} bytes");
+
+                    var mips = UnpackMipAtlas(processedAtlas, new MipAtlasParams(
+                        width, height, texture.ActualFormat,
+                        width, height, outputPath, options?.SaveMips ?? false));
+                    if (_verboseLogging) Console.WriteLine($"Extracted {mips.Length} bytes of mips from atlas");
+
+                    linearData = new byte[processedMain.Length + mips.Length];
+                    Array.Copy(processedMain, 0, linearData, 0, processedMain.Length);
+                    Array.Copy(mips, 0, linearData, processedMain.Length, mips.Length);
+
+                    // Count mip levels
+                    var mipLevels = 1;
+                    var mw = width / 2;
+                    var mh = height / 2;
+                    var mipDataSize = 0;
+                    while (mw >= 4 && mh >= 4 && mipDataSize < mips.Length)
+                    {
+                        mipDataSize += TextureUtilities.CalculateMipSize(mw, mh, texture.ActualFormat);
+                        mipLevels++;
+                        mw /= 2;
+                        mh /= 2;
+                    }
+
+                    texture.MipLevels = (byte)mipLevels;
+                    if (_verboseLogging)
+                        Console.WriteLine(
+                            $"Combined {processedMain.Length} bytes main + {mips.Length} bytes mips, MipLevels={texture.MipLevels}");
+                }
                 else
                 {
                     // Small texture - might use horizontal split for 256x256
@@ -458,7 +723,7 @@ public class DdxParser(bool verbose = false)
                     var chunk2Width = 64;
                     var chunkHeight = 256;
 
-                    var horizontalChunk1Size = CalculateMipSize(chunk1Width, chunkHeight, texture.ActualFormat);
+                    var horizontalChunk1Size = TextureUtilities.CalculateMipSize(chunk1Width, chunkHeight, texture.ActualFormat);
                     var horizontalChunk2Size = mainData.Length - horizontalChunk1Size;
 
                     if (_verboseLogging)
@@ -510,7 +775,7 @@ public class DdxParser(bool verbose = false)
 
                         // For a 128x128 mip: 16384 bytes
                         // Check if we have exactly one mip's worth
-                        var expectedMip1Size = CalculateMipSize(width / 2, height / 2, texture.ActualFormat);
+                        var expectedMip1Size = TextureUtilities.CalculateMipSize(width / 2, height / 2, texture.ActualFormat);
                         if (remainingSize == expectedMip1Size)
                         {
                             if (_verboseLogging)
@@ -552,7 +817,7 @@ public class DdxParser(bool verbose = false)
                 // Check if this looks like an atlas chunk (roughly half of full texture size with mips)
                 // Atlas typically contains mip levels 1+ packed together
                 var estimatedAtlasSize =
-                    CalculateMipSize(width, height, texture.ActualFormat); // Size of one surface at this resolution
+                    TextureUtilities.CalculateMipSize(width, height, texture.ActualFormat); // Size of one surface at this resolution
                 var isLikelyAtlas = mainData.Length >= estimatedAtlasSize / 4 && mainData.Length <= estimatedAtlasSize;
 
                 if (isLikelyAtlas && width >= 128 && height >= 128)
@@ -562,10 +827,6 @@ public class DdxParser(bool verbose = false)
                         Console.WriteLine(
                             $"Detected atlas-only data ({mainData.Length} bytes) - attempting mip extraction");
 
-                    // Determine atlas dimensions from the data size
-                    var blockSize = GetBlockSize(texture.ActualFormat);
-                    var blocksInData = mainData.Length / blockSize;
-
                     // Try to find atlas dimensions that fit the data
                     int atlasWidth = width;
                     int atlasHeight = height;
@@ -574,7 +835,7 @@ public class DdxParser(bool verbose = false)
                     // 512x512 main -> 512x512 atlas (131072 bytes for DXT5)
                     // 256x256 main -> 256x256 atlas (32768 bytes for DXT5)
                     // 1024x1024 main -> 1024x1024 atlas (524288 bytes for DXT5)
-                    var expectedAtlasDataSize = CalculateMipSize(width, height, texture.ActualFormat);
+                    var expectedAtlasDataSize = TextureUtilities.CalculateMipSize(width, height, texture.ActualFormat);
 
                     if (mainData.Length == expectedAtlasDataSize)
                     {
@@ -624,12 +885,12 @@ public class DdxParser(bool verbose = false)
                     var mipCount = 0;
 
                     // Mip 0 (from atlas perspective, which is mip 1 of original): W/2 x H/2, split into two halves
-                    var topHalf = ExtractAtlasRegion(untiledAtlas, atlasWidth, atlasHeight,
-                        0, 0, largestMipWidth, halfHeight, texture.ActualFormat);
-                    var bottomHalf = ExtractAtlasRegion(untiledAtlas, atlasWidth, atlasHeight,
-                        largestMipWidth, 0, largestMipWidth, halfHeight, texture.ActualFormat);
+                    var topHalf = ExtractAtlasRegion(untiledAtlas, new AtlasRegionParams(
+                        atlasWidth, atlasHeight, 0, 0, largestMipWidth, halfHeight, texture.ActualFormat));
+                    var bottomHalf = ExtractAtlasRegion(untiledAtlas, new AtlasRegionParams(
+                        atlasWidth, atlasHeight, largestMipWidth, 0, largestMipWidth, halfHeight, texture.ActualFormat));
 
-                    var expectedHalfSize = CalculateMipSize(largestMipWidth, halfHeight, texture.ActualFormat);
+                    var expectedHalfSize = TextureUtilities.CalculateMipSize(largestMipWidth, halfHeight, texture.ActualFormat);
 
                     if (topHalf != null && bottomHalf != null &&
                         topHalf.Length == expectedHalfSize && bottomHalf.Length == expectedHalfSize)
@@ -653,12 +914,12 @@ public class DdxParser(bool verbose = false)
 
                         while (mipW >= 4 && mipH >= 4 && mipX + mipW <= atlasWidth && mipY + mipH <= atlasHeight)
                         {
-                            var mipData = ExtractAtlasRegion(untiledAtlas, atlasWidth, atlasHeight,
-                                mipX, mipY, mipW, mipH, texture.ActualFormat);
+                            var mipData = ExtractAtlasRegion(untiledAtlas, new AtlasRegionParams(
+                                atlasWidth, atlasHeight, mipX, mipY, mipW, mipH, texture.ActualFormat));
 
                             if (mipData != null)
                             {
-                                var expectedSize = CalculateMipSize(mipW, mipH, texture.ActualFormat);
+                                var expectedSize = TextureUtilities.CalculateMipSize(mipW, mipH, texture.ActualFormat);
                                 if (mipData.Length == expectedSize)
                                 {
                                     mipDataList.Add(mipData);
@@ -755,7 +1016,6 @@ public class DdxParser(bool verbose = false)
                 // For 256x256 header with 65536 bytes: could be 128x128 mip chain packed in 256x256 tiled space
                 var halfWidth = width / 2;
                 var halfHeight = height / 2;
-                var halfMipChainSize = CalculateMipChainSize(halfWidth, halfHeight, texture.ActualFormat);
 
                 // If the data size is close to what a full mip chain for width/2 x height/2 would need
                 // when packed into the full width x height tile space, treat it as a packed mip atlas
@@ -812,9 +1072,9 @@ public class DdxParser(bool verbose = false)
                             $"Untiled chunks to {chunk1UntiledAlt.Length} + {chunk2UntiledAlt.Length} bytes");
 
                     // Chunk 1 might have mips packed
-                    var mipsAlt = UnpackMipAtlas(chunk1UntiledAlt, width, height, texture.ActualFormat, width,
-                        height,
-                        outputPath, options?.SaveMips ?? false);
+                    var mipsAlt = UnpackMipAtlas(chunk1UntiledAlt, new MipAtlasParams(
+                        width, height, texture.ActualFormat,
+                        width, height, outputPath, options?.SaveMips ?? false));
                     if (_verboseLogging) Console.WriteLine($"Extracted {mipsAlt.Length} bytes of mips from chunk 1");
 
                     linearData = new byte[chunk2UntiledAlt.Length + mipsAlt.Length];
@@ -848,8 +1108,9 @@ public class DdxParser(bool verbose = false)
                     Console.WriteLine($"Untiled chunks to {chunk1Untiled.Length} + {chunk2Untiled.Length} bytes");
 
                 // Chunk 1 has mip atlas, chunk 2 has main surface
-                var mips = UnpackMipAtlas(chunk1Untiled, squareSize, squareSize, texture.ActualFormat, squareSize,
-                    squareSize, outputPath, options?.SaveMips ?? false);
+                var mips = UnpackMipAtlas(chunk1Untiled, new MipAtlasParams(
+                    squareSize, squareSize, texture.ActualFormat,
+                    squareSize, squareSize, outputPath, options?.SaveMips ?? false));
                 if (_verboseLogging) Console.WriteLine($"Extracted {mips.Length} bytes of mips from chunk 1");
 
                 linearData = new byte[chunk2Untiled.Length + mips.Length];
@@ -858,7 +1119,7 @@ public class DdxParser(bool verbose = false)
 
                 texture.Width = (ushort)squareSize;
                 texture.Height = (ushort)squareSize;
-                texture.MipLevels = CalculateMipLevels((uint)squareSize, (uint)squareSize);
+                texture.MipLevels = TextureUtilities.CalculateMipLevels((uint)squareSize, (uint)squareSize);
                 if (_verboseLogging)
                     Console.WriteLine(
                         $"Final texture: {texture.Width}x{texture.Height} with {texture.MipLevels} mip levels");
@@ -873,11 +1134,6 @@ public class DdxParser(bool verbose = false)
                 // 1. A proper WxH texture (just untile)
                 // 2. For certain sizes (256x256, 512x512): a W/2 x H/2 texture with mips packed in WxH tiled space
                 //    This happens when memory-carved DDX headers overstate the size
-
-                var blockSize = texture.ActualFormat is 0x82 or 0x52 or
-                    0x7B
-                    ? 8
-                    : 16;
 
                 // Check for 128x128 texture with mip atlas
                 var atlasSize128 = 24576;
@@ -906,8 +1162,9 @@ public class DdxParser(bool verbose = false)
                     if (_verboseLogging) Console.WriteLine($"Saved untiled atlas to {atlasPath}");
 
                     // Extract mips from atlas
-                    var mips = UnpackMipAtlas(untiledAtlas, 256, 192, texture.ActualFormat, 128, 128, outputPath,
-                        options?.SaveMips ?? false);
+                    var mips = UnpackMipAtlas(untiledAtlas, new MipAtlasParams(
+                        256, 192, texture.ActualFormat,
+                        128, 128, outputPath, options?.SaveMips ?? false));
                     if (_verboseLogging) Console.WriteLine($"Extracted {mips.Length} bytes of mips from atlas");
 
                     // Combine main + mips
@@ -917,7 +1174,7 @@ public class DdxParser(bool verbose = false)
 
                     texture.Width = 128;
                     texture.Height = 128;
-                    texture.MipLevels = CalculateMipLevels(128, 128);
+                    texture.MipLevels = TextureUtilities.CalculateMipLevels(128, 128);
                     if (_verboseLogging)
                         Console.WriteLine(
                             $"Final: 128x128 with {texture.MipLevels} mip levels, {linearData.Length} bytes total");
@@ -1045,7 +1302,8 @@ public class DdxParser(bool verbose = false)
         var info = new D3DTextureInfo
         {
             // Set dimensions from parameters
-            Width = width, Height = height
+            Width = width,
+            Height = height
         };
 
         // Our header starts at file offset 0x08
@@ -1077,127 +1335,34 @@ public class DdxParser(bool verbose = false)
         info.ActualFormat = actualFormat != 0 ? actualFormat : info.DataFormat;
 
         // Determine DDS format
-        info.Format = GetDxgiFormat(info.ActualFormat);
+        info.Format = TextureUtilities.GetDxgiFormat(info.ActualFormat);
 
         // Calculate mip levels from dimensions
-        info.MipLevels = CalculateMipLevels(info.Width, info.Height);
+        info.MipLevels = TextureUtilities.CalculateMipLevels(info.Width, info.Height);
 
         // Calculate main data size (before mip tail)
-        info.MainDataSize = CalculateMainDataSize(info.Width, info.Height, info.ActualFormat, info.MipLevels);
+        info.MainDataSize = TextureUtilities.CalculateMainDataSize(info.Width, info.Height, info.ActualFormat, info.MipLevels);
 
         return info;
-    }
-
-    private static uint GetDxgiFormat(uint gpuFormat)
-    {
-        // Map Xbox 360 GPU texture formats to D3D formats
-        // For 0x82 base format, the actual format is determined by DWORD[4]
-
-        return gpuFormat switch
-        {
-            0x52 => 0x31545844, // DXT1
-            0x53 => 0x33545844, // DXT3  
-            0x54 => 0x35545844, // DXT5
-            0x71 => 0x32495441, // ATI2 (BC5) - Xbox 360 normal map format
-            0x7B => 0x31495441, // ATI1 (BC4) - Single channel format (specular maps)
-            0x82 => 0x31545844, // DXT1 (default when DWORD[4] is 0)
-            0x86 => 0x31545844, // DXT1 variant
-            0x88 => 0x35545844, // DXT5 variant
-            0x12 => 0x31545844, // GPUTEXTUREFORMAT_DXT1
-            0x13 => 0x33545844, // GPUTEXTUREFORMAT_DXT2/3
-            0x14 => 0x35545844, // GPUTEXTUREFORMAT_DXT4/5
-            0x06 => 0x18280046, // GPUTEXTUREFORMAT_8_8_8_8 -> A8R8G8B8
-            0x04 => 0x28280044, // GPUTEXTUREFORMAT_5_6_5 -> R5G6B5
-            _ => 0x31545844 // Default to DXT1
-        };
-    }
-
-    private static uint CalculateMipLevels(uint width, uint height)
-    {
-        uint levels = 1;
-        var w = width;
-        var h = height;
-
-        while (w > 1 || h > 1)
-        {
-            w = Math.Max(1, w / 2);
-            h = Math.Max(1, h / 2);
-            levels++;
-        }
-
-        return levels;
-    }
-
-    private static uint CalculateMainDataSize(uint width, uint height, uint format, uint mipLevels)
-    {
-        uint totalSize = 0;
-        var w = width;
-        var h = height;
-
-        for (var i = 0; i < mipLevels; i++)
-        {
-            var mipSize = CalculateMipSize(w, h, format);
-            totalSize += mipSize;
-
-            w = Math.Max(1, w / 2);
-            h = Math.Max(1, h / 2);
-        }
-
-        return totalSize;
-    }
-
-    private static uint CalculateMipSize(uint width, uint height, uint format)
-    {
-        // Calculate size based on format
-        return format switch
-        {
-            // DXT1
-            0x52 or 0x7B or 0x82 or 0x86 or 0x12 => Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 8,
-            // DXT3
-            0x53 or 0x54 or 0x71 or 0x88 or 0x13 or 0x14 => Math.Max(1, (width + 3) / 4) *
-                                                            Math.Max(1, (height + 3) / 4) * 16,
-            // A8R8G8B8 - 32 bits per pixel
-            0x06 => width * height * 4,
-            // R5G6B5 - 16 bits per pixel
-            0x04 => width * height * 2,
-            _ => width * height * 4 // Default to 32bpp
-        };
-    }
-
-    private static int CalculateMipSize(int width, int height, uint format)
-    {
-        return (int)CalculateMipSize((uint)width, (uint)height, format);
-    }
-
-    private static int GetBlockSize(uint format)
-    {
-        return format switch
-        {
-            // DXT1
-            0x52 or 0x7B or 0x82 or 0x86 or 0x12 => 8,
-            // DXT3
-            _ => 16
-        };
     }
 
     /// <summary>
     ///     Extract a rectangular region from atlas data.
     ///     Handles DXT block alignment.
     /// </summary>
-    private static byte[]? ExtractAtlasRegion(byte[] atlasData, int atlasWidth, int atlasHeight,
-        int regionX, int regionY, int regionWidth, int regionHeight, uint format)
+    private static byte[]? ExtractAtlasRegion(byte[] atlasData, AtlasRegionParams p)
     {
-        var blockSize = GetBlockSize(format);
+        var blockSize = TextureUtilities.GetBlockSize(p.Format);
         var blockWidth = 4; // DXT block size in pixels
         var blockHeight = 4;
 
         // Calculate block counts
-        var atlasBlocksX = (atlasWidth + blockWidth - 1) / blockWidth;
-        var atlasBlocksY = (atlasHeight + blockHeight - 1) / blockHeight;
-        var regionBlocksX = (regionWidth + blockWidth - 1) / blockWidth;
-        var regionBlocksY = (regionHeight + blockHeight - 1) / blockHeight;
-        var startBlockX = regionX / blockWidth;
-        var startBlockY = regionY / blockHeight;
+        var atlasBlocksX = (p.AtlasWidth + blockWidth - 1) / blockWidth;
+        var atlasBlocksY = (p.AtlasHeight + blockHeight - 1) / blockHeight;
+        var regionBlocksX = (p.RegionWidth + blockWidth - 1) / blockWidth;
+        var regionBlocksY = (p.RegionHeight + blockHeight - 1) / blockHeight;
+        var startBlockX = p.RegionX / blockWidth;
+        var startBlockY = p.RegionY / blockHeight;
 
         var outputSize = regionBlocksX * regionBlocksY * blockSize;
         var output = new byte[outputSize];
@@ -1226,24 +1391,6 @@ public class DdxParser(bool verbose = false)
     }
 
     /// <summary>
-    ///     Calculate total size of a full mip chain from the given dimensions down to 4x4.
-    /// </summary>
-    private static uint CalculateMipChainSize(int width, int height, uint format)
-    {
-        uint totalSize = 0;
-        var w = width;
-        var h = height;
-        while (w >= 4 && h >= 4)
-        {
-            totalSize += (uint)CalculateMipSize(w, h, format);
-            w /= 2;
-            h /= 2;
-        }
-
-        return totalSize;
-    }
-
-    /// <summary>
     ///     Try to extract mip levels from a packed mip atlas.
     ///     The atlas has the base mip (baseWidth x baseHeight) in the top-left,
     ///     with smaller mips packed vertically in the right column.
@@ -1260,16 +1407,17 @@ public class DdxParser(bool verbose = false)
         //                         [4x4 mip5 (128,120)]
         // All smaller mips are in the RIGHT column (x = baseWidth), stacked vertically
 
-        _ = GetBlockSize(format);
+        _ = TextureUtilities.GetBlockSize(format);
 
         var mipDataList = new List<byte[]>();
         var totalMipSize = 0;
 
         // Extract base mip from top-left quadrant
-        var baseMip = ExtractAtlasRegion(untiledData, atlasWidth, atlasHeight, 0, 0, baseWidth, baseHeight, format);
+        var baseMip = ExtractAtlasRegion(untiledData, new AtlasRegionParams(
+            atlasWidth, atlasHeight, 0, 0, baseWidth, baseHeight, format));
         if (baseMip == null) return null;
 
-        var expectedBaseSize = CalculateMipSize(baseWidth, baseHeight, format);
+        var expectedBaseSize = TextureUtilities.CalculateMipSize(baseWidth, baseHeight, format);
         if (baseMip.Length != expectedBaseSize)
         {
             if (verbose)
@@ -1298,8 +1446,9 @@ public class DdxParser(bool verbose = false)
 
         if (mip1W >= 4 && mip1X + mip1W <= atlasWidth)
         {
-            var mip1 = ExtractAtlasRegion(untiledData, atlasWidth, atlasHeight, mip1X, mip1Y, mip1W, mip1H, format);
-            if (mip1 != null && mip1.Length == CalculateMipSize(mip1W, mip1H, format))
+            var mip1 = ExtractAtlasRegion(untiledData, new AtlasRegionParams(
+                atlasWidth, atlasHeight, mip1X, mip1Y, mip1W, mip1H, format));
+            if (mip1 != null && mip1.Length == TextureUtilities.CalculateMipSize(mip1W, mip1H, format))
             {
                 mipDataList.Add(mip1);
                 totalMipSize += mip1.Length;
@@ -1315,8 +1464,9 @@ public class DdxParser(bool verbose = false)
 
         if (mip2W >= 4 && mip2X + mip2W <= atlasWidth && mip2Y + mip2H <= atlasHeight)
         {
-            var mip2 = ExtractAtlasRegion(untiledData, atlasWidth, atlasHeight, mip2X, mip2Y, mip2W, mip2H, format);
-            if (mip2 != null && mip2.Length == CalculateMipSize(mip2W, mip2H, format))
+            var mip2 = ExtractAtlasRegion(untiledData, new AtlasRegionParams(
+                atlasWidth, atlasHeight, mip2X, mip2Y, mip2W, mip2H, format));
+            if (mip2 != null && mip2.Length == TextureUtilities.CalculateMipSize(mip2W, mip2H, format))
             {
                 mipDataList.Add(mip2);
                 totalMipSize += mip2.Length;
@@ -1339,8 +1489,9 @@ public class DdxParser(bool verbose = false)
 
         if (mip3W >= 4 && mip3X + mip3W <= atlasWidth && mip3Y + mip3H <= atlasHeight)
         {
-            var mip3 = ExtractAtlasRegion(untiledData, atlasWidth, atlasHeight, mip3X, mip3Y, mip3W, mip3H, format);
-            if (mip3 != null && mip3.Length == CalculateMipSize(mip3W, mip3H, format))
+            var mip3 = ExtractAtlasRegion(untiledData, new AtlasRegionParams(
+                atlasWidth, atlasHeight, mip3X, mip3Y, mip3W, mip3H, format));
+            if (mip3 != null && mip3.Length == TextureUtilities.CalculateMipSize(mip3W, mip3H, format))
             {
                 mipDataList.Add(mip3);
                 totalMipSize += mip3.Length;
@@ -1356,8 +1507,9 @@ public class DdxParser(bool verbose = false)
 
         if (mip4W >= 4 && mip4X + mip4W <= atlasWidth && mip4Y + mip4H <= atlasHeight)
         {
-            var mip4 = ExtractAtlasRegion(untiledData, atlasWidth, atlasHeight, mip4X, mip4Y, mip4W, mip4H, format);
-            if (mip4 != null && mip4.Length == CalculateMipSize(mip4W, mip4H, format))
+            var mip4 = ExtractAtlasRegion(untiledData, new AtlasRegionParams(
+                atlasWidth, atlasHeight, mip4X, mip4Y, mip4W, mip4H, format));
+            if (mip4 != null && mip4.Length == TextureUtilities.CalculateMipSize(mip4W, mip4H, format))
             {
                 mipDataList.Add(mip4);
                 totalMipSize += mip4.Length;
@@ -1373,8 +1525,9 @@ public class DdxParser(bool verbose = false)
 
         if (mip5W >= 4 && mip5X + mip5W <= atlasWidth && mip5Y + mip5H <= atlasHeight)
         {
-            var mip5 = ExtractAtlasRegion(untiledData, atlasWidth, atlasHeight, mip5X, mip5Y, mip5W, mip5H, format);
-            if (mip5 != null && mip5.Length == CalculateMipSize(mip5W, mip5H, format))
+            var mip5 = ExtractAtlasRegion(untiledData, new AtlasRegionParams(
+                atlasWidth, atlasHeight, mip5X, mip5Y, mip5W, mip5H, format));
+            if (mip5 != null && mip5.Length == TextureUtilities.CalculateMipSize(mip5W, mip5H, format))
             {
                 mipDataList.Add(mip5);
                 totalMipSize += mip5.Length;
@@ -1608,66 +1761,27 @@ public class DdxParser(bool verbose = false)
         return result;
     }
 
-    private static bool GetPackedMipOffset(int texWidth, int texHeight, int mipLevel, out int xBlocks, out int yBlocks)
+    private byte[] UnpackMipAtlas(byte[] atlasData, MipAtlasParams p)
     {
-        // Xbox 360 packed mip algorithm from Xenia
-        // Mips with smallest dimension <=16 get packed into a single tile (32x32 texels)
-        var log2Width = (int)Math.Ceiling(Math.Log(texWidth, 2));
-        var log2Height = (int)Math.Ceiling(Math.Log(texHeight, 2));
-        var log2Size = Math.Min(log2Width, log2Height);
+        var width = p.AtlasWidth;
+        var height = p.AtlasHeight;
+        var format = p.Format;
+        var mainWidth = p.MainWidth;
+        var mainHeight = p.MainHeight;
+        var outputPath = p.OutputPath;
+        var saveMips = p.SaveMips;
 
-        if (log2Size > 4 + mipLevel)
+        // Early exit for tiny textures (smaller than minimum DXT block size of 4x4)
+        // These textures cannot have valid mips and don't need atlas unpacking
+        if (mainWidth < 4 || mainHeight < 4 || width < 4 || height < 4)
         {
-            // The shortest dimension is bigger than 16, not packed
-            xBlocks = 0;
-            yBlocks = 0;
-            return false;
+            if (_verboseLogging)
+                Console.WriteLine(
+                    $"UnpackMipAtlas: skipping for tiny texture ({mainWidth}x{mainHeight}), returning empty mips");
+
+            return [];
         }
 
-        var packedMipBase = log2Size > 4 ? log2Size - 4 : 0;
-        var packedMip = mipLevel - packedMipBase;
-
-        // Find the block offset of the mip
-        if (packedMip < 3)
-        {
-            if (log2Width > log2Height)
-            {
-                // Wider than tall. Laid out vertically.
-                xBlocks = 0;
-                yBlocks = 16 >> packedMip;
-            }
-            else
-            {
-                // Taller than wide. Laid out horizontally.
-                xBlocks = 16 >> packedMip;
-                yBlocks = 0;
-            }
-        }
-        else
-        {
-            int offset;
-            if (log2Width > log2Height)
-            {
-                // Wider than tall. Laid out horizontally.
-                offset = (1 << (log2Width - packedMipBase)) >> (packedMip - 2);
-                xBlocks = offset;
-                yBlocks = 0;
-            }
-            else
-            {
-                // Taller than wide. Laid out vertically.
-                xBlocks = 0;
-                offset = (1 << (log2Height - packedMipBase)) >> (packedMip - 2);
-                yBlocks = offset;
-            }
-        }
-
-        return true;
-    }
-
-    private byte[] UnpackMipAtlas(byte[] atlasData, int width, int height, uint format, int mainWidth, int mainHeight,
-        string? outputPath = null, bool saveMips = false)
-    {
         // Determine block size based on format
         var blockSize = format switch
         {
@@ -1689,7 +1803,10 @@ public class DdxParser(bool verbose = false)
         // If the atlas matches the main texture width or height, assume it's a stacked atlas
         // (vertical or horizontal stacking) and keep main dimensions instead of deriving
         // from the atlas ratio (which can yield strange sizes like 128x409).
-        if ((width == mainWidth && height >= mainHeight) || (height == mainHeight && width >= mainWidth))
+        // We also set actualFromMain=true when atlas width < mainWidth but heights match,
+        // which indicates a horizontally-stacked mip atlas (e.g., 320x16 atlas for 512x16 texture).
+        if ((width == mainWidth && height >= mainHeight) || (height == mainHeight && width >= mainWidth) ||
+            (height == mainHeight && width < mainWidth) || (width == mainWidth && height < mainHeight))
         {
             actualWidth = mainWidth;
             actualHeight = mainHeight;
@@ -1755,8 +1872,8 @@ public class DdxParser(bool verbose = false)
         }
 
         // Calculate total size needed for all mips linearly packed
-        var mipCount = CalculateMipLevels((uint)actualWidth, (uint)actualHeight);
-        var totalSize = CalculateMainDataSize((uint)actualWidth, (uint)actualHeight, format, mipCount);
+        var mipCount = TextureUtilities.CalculateMipLevels((uint)actualWidth, (uint)actualHeight);
+        var totalSize = TextureUtilities.CalculateMainDataSize((uint)actualWidth, (uint)actualHeight, format, mipCount);
         var output = new byte[totalSize];
         var outputOffset = 0;
 
@@ -1768,7 +1885,7 @@ public class DdxParser(bool verbose = false)
         var debugH = actualHeight;
         for (var m = 0; m < mipCount; m++)
         {
-            var s = CalculateMipSize(debugW, debugH, format);
+            var s = TextureUtilities.CalculateMipSize(debugW, debugH, format);
             if (_verboseLogging) Console.WriteLine($"  mip {m}: {debugW}x{debugH} -> {s} bytes");
 
             debugW = Math.Max(1, debugW / 2);
@@ -1783,7 +1900,7 @@ public class DdxParser(bool verbose = false)
         // User measurements (in pixels): 0,0 | 512,0 | 0,256 | 256,256 | 512,256 | 640,256 | 768,256 | 912,256 | 904,256 | 900,256 | 896,264 | 896,260
         if (_verboseLogging)
             Console.WriteLine(
-                $"UnpackMipAtlas: width={width}, height={height}, actualTexture={actualWidth}x{actualHeight}, using {(width == 256 && height == 192 ? "256x192" : width == 1024 && height == 1024 ? "1024x1024" : "calculated")} mip layout");
+                $"UnpackMipAtlas: width={width}, height={height}, actualTexture={actualWidth}x{actualHeight}, using {GetMipLayoutName(width, height)} mip layout");
 
         // Special handling for 1024x1024 atlas with split mips
         if (width == 1024 && height == 1024)
@@ -1796,27 +1913,27 @@ public class DdxParser(bool verbose = false)
 
             // 512/4 * 256/4 = 128 * 64 blocks for each half
             for (var by = 0; by < 64; by++)
-            for (var bx = 0; bx < 128; bx++)
-            {
-                var srcOffset = (by * atlasWidthInBlocks + bx) * blockSize;
-                if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
-                    Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
+                for (var bx = 0; bx < 128; bx++)
+                {
+                    var srcOffset = (by * atlasWidthInBlocks + bx) * blockSize;
+                    if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                        Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
 
-                outputOffset += blockSize;
-            }
+                    outputOffset += blockSize;
+                }
 
             // Extract bottom half at (512, 0) = block (128, 0)
             for (var by = 0; by < 64; by++)
-            for (var bx = 0; bx < 128; bx++)
-            {
-                var srcBlockX = 128 + bx;
-                var srcBlockY = by;
-                var srcOffset = (srcBlockY * atlasWidthInBlocks + srcBlockX) * blockSize;
-                if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
-                    Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
+                for (var bx = 0; bx < 128; bx++)
+                {
+                    var srcBlockX = 128 + bx;
+                    var srcBlockY = by;
+                    var srcOffset = (srcBlockY * atlasWidthInBlocks + srcBlockX) * blockSize;
+                    if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                        Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
 
-                outputOffset += blockSize;
-            }
+                    outputOffset += blockSize;
+                }
 
             // After top/bottom halves for mip 0, save mip 0 if requested
             var mip0End = outputOffset;
@@ -1830,7 +1947,7 @@ public class DdxParser(bool verbose = false)
                     {
                         Width = 512,
                         Height = 512,
-                        Format = GetDxgiFormat(format),
+                        Format = TextureUtilities.GetDxgiFormat(format),
                         ActualFormat = format,
                         DataFormat = format,
                         MipLevels = 1
@@ -1852,25 +1969,25 @@ public class DdxParser(bool verbose = false)
             var mip1Start = outputOffset;
             // Top half: (0, 256) = block (0, 64), size 256x128 = 64x32 blocks
             for (var by = 0; by < 32; by++)
-            for (var bx = 0; bx < 64; bx++)
-            {
-                var srcOffset = ((64 + by) * atlasWidthInBlocks + bx) * blockSize;
-                if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
-                    Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
+                for (var bx = 0; bx < 64; bx++)
+                {
+                    var srcOffset = ((64 + by) * atlasWidthInBlocks + bx) * blockSize;
+                    if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                        Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
 
-                outputOffset += blockSize;
-            }
+                    outputOffset += blockSize;
+                }
 
             // Bottom half: (256, 256) = block (64, 64)
             for (var by = 0; by < 32; by++)
-            for (var bx = 0; bx < 64; bx++)
-            {
-                var srcOffset = ((64 + by) * atlasWidthInBlocks + 64 + bx) * blockSize;
-                if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
-                    Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
+                for (var bx = 0; bx < 64; bx++)
+                {
+                    var srcOffset = ((64 + by) * atlasWidthInBlocks + 64 + bx) * blockSize;
+                    if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                        Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
 
-                outputOffset += blockSize;
-            }
+                    outputOffset += blockSize;
+                }
 
             // After top/bottom halves for mip 1, save mip 1 if requested
             var mip1End = outputOffset;
@@ -1884,7 +2001,7 @@ public class DdxParser(bool verbose = false)
                     {
                         Width = 256,
                         Height = 256,
-                        Format = GetDxgiFormat(format),
+                        Format = TextureUtilities.GetDxgiFormat(format),
                         ActualFormat = format,
                         DataFormat = format,
                         MipLevels = 1
@@ -1923,17 +2040,17 @@ public class DdxParser(bool verbose = false)
                     Console.WriteLine($"Extracting mip {i + 2}: {mipW}x{mipH} from atlas position ({mipX}, {mipY})");
 
                 for (var by = 0; by < mipHeightInBlocks; by++)
-                for (var bx = 0; bx < mipWidthInBlocks; bx++)
-                {
-                    var srcBlockX = mipXInBlocks + bx;
-                    var srcBlockY = mipYInBlocks + by;
-                    var srcOffset = (srcBlockY * atlasWidthInBlocks + srcBlockX) * blockSize;
+                    for (var bx = 0; bx < mipWidthInBlocks; bx++)
+                    {
+                        var srcBlockX = mipXInBlocks + bx;
+                        var srcBlockY = mipYInBlocks + by;
+                        var srcOffset = (srcBlockY * atlasWidthInBlocks + srcBlockX) * blockSize;
 
-                    if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
-                        Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
+                        if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                            Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
 
-                    outputOffset += blockSize;
-                }
+                        outputOffset += blockSize;
+                    }
 
                 // Save each of these small non-split mips, if requested
                 if (saveMips && outputPath != null)
@@ -1941,7 +2058,7 @@ public class DdxParser(bool verbose = false)
                     {
                         var thisMipEnd = outputOffset;
                         // compute start by subtracting the mip size
-                        var thisMipSize = CalculateMipSize(mipW, mipH, format);
+                        var thisMipSize = TextureUtilities.CalculateMipSize(mipW, mipH, format);
                         var thisMipStart = Math.Max(0, thisMipEnd - thisMipSize);
                         var mdata = new byte[thisMipSize];
                         Array.Copy(output, thisMipStart, mdata, 0, thisMipSize);
@@ -1949,7 +2066,7 @@ public class DdxParser(bool verbose = false)
                         {
                             Width = (uint)mipW,
                             Height = (uint)mipH,
-                            Format = GetDxgiFormat(format),
+                            Format = TextureUtilities.GetDxgiFormat(format),
                             ActualFormat = format,
                             DataFormat = format,
                             MipLevels = 1
@@ -1970,54 +2087,7 @@ public class DdxParser(bool verbose = false)
             return trimmed;
         }
 
-        (int x, int y, int w, int h)[] mipPositions = width == 256 && height == 192
-            ?
-            [
-                (0, 0, 16, 16), // Mip 0: 64x64 at (0,0)
-                (32, 0, 8, 8), // Mip 1: 32x32 at (128,0)
-                (4, 32, 4, 4), // Mip 2: 16x16 at (16,128)
-                (2, 32, 2, 2), // Mip 3: 8x8 at (8,128)
-                (1, 32, 1, 1), // Mip 4: 4x4 at (4,128)
-                (0, 34, 1, 1), // Mip 5: 2x2 at (0,136) - sub-block
-                (0, 33, 1, 1) // Mip 6: 1x1 at (0,132) - sub-block
-            ]
-            : width == 128 && height == 320
-                ?
-                [
-                    // Measured for 128x512 texture with 128x320 atlas
-                    // User provided pixel measurements:
-                    //  - 64x256 at (0,0)
-                    //  - 32x64  at (0,256)
-                    // Convert to blocks (4x4 pixels per block): x/4, y/4, w/4, h/4
-                    (0, 0, 16, 64), // Mip: 64x256 at (0,0)
-                    (0, 64, 8, 16) // Mip: 32x64  at (0,256)
-                ]
-                : width == 320 && height == 256
-                    ?
-                    [
-                        // 512x256 texture mips manually measured
-                        (0, 0, 64, 32), // Mip 0: 256x128 at (0,0)
-                        (0, 32, 32, 16), // Mip 1: 128x64 at (0,128)
-                        (32, 32, 16, 8), // Mip 2: 64x32 at (128,128)
-                        (64, 36, 8, 4), // Mip 3: 32x16 at (256,144)
-                        (64, 34, 4, 2), // Mip 4: 16x8 at (256,136)
-                        (64, 33, 2, 1), // Mip 5: 8x4 at (256,132)
-                        (68, 32, 1, 1), // Mip 6: 4x2 at (272,128) - sub-block, store as 1 block (4x4)
-                        (66, 32, 1, 1), // Mip 7: 2x1 at (264,128) - sub-block, store as 1 block (4x4)
-                        (65, 32, 1, 1) // Mip 8: 1x1 at (260,128) - sub-block, store as 1 block (4x4)
-                    ]
-                    :
-                    [
-                        // Default 256x256 atlas for 128x128 texture
-                        (0, 0, 32, 32), // Mip 0: 128x128 at (0,0)
-                        (32, 0, 16, 16), // Mip 1: 64x64 at (128,0)
-                        (0, 32, 8, 8), // Mip 2: 32x32 at (0,128)
-                        (36, 32, 4, 4), // Mip 3: 16x16 at (144,128)
-                        (34, 32, 2, 2), // Mip 4: 8x8 at (136,128)
-                        (33, 32, 1, 1), // Mip 5: 4x4 at (132,128)
-                        (32, 34, 1, 1), // Mip 6: 2x2 at (128,136) - sub-block
-                        (32, 33, 1, 1) // Mip 7: 1x1 at (128,132) - sub-block
-                    ];
+        var mipPositions = GetMipPositions(width, height);
 
         // Track which atlas blocks we've consumed we can pick remaining blocks if needed
         var usedBlocks = new bool[height / 4, width / 4];
@@ -2073,7 +2143,7 @@ public class DdxParser(bool verbose = false)
 
             _ = Math.Max(1, mainWidth / 4);
             var mainBlocksH = Math.Max(1, mainHeight / 4);
-            var mips = (int)CalculateMipLevels((uint)mainWidth, (uint)mainHeight);
+            var mips = (int)TextureUtilities.CalculateMipLevels((uint)mainWidth, (uint)mainHeight);
             for (var i = 0; i < mips; i++)
             {
                 var mbW = Math.Max(1, (mW + 3) / 4);
@@ -2146,25 +2216,24 @@ public class DdxParser(bool verbose = false)
 
             // Extract this mip from the atlas
             for (var by = 0; by < mipHeightInBlocks; by++)
-            for (var bx = 0; bx < mipWidthInBlocks; bx++)
-            {
-                var srcBlockX = mipXInBlocks + bx;
-                var srcBlockY = mipYInBlocks + by;
-                var srcOffset = (srcBlockY * atlasWidthInBlocks + srcBlockX) * blockSize;
-
-                if (srcBlockX >= 0 && srcBlockX < atlasWBlocks && srcBlockY >= 0 && srcBlockY < atlasHBlocks
-                    && srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                for (var bx = 0; bx < mipWidthInBlocks; bx++)
                 {
-                    Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
-                    usedBlocks[srcBlockY, srcBlockX] = true;
-                    if (saveMips && bx == 0 && by == 0)
-                        if (_verboseLogging)
+                    var srcBlockX = mipXInBlocks + bx;
+                    var srcBlockY = mipYInBlocks + by;
+                    var srcOffset = (srcBlockY * atlasWidthInBlocks + srcBlockX) * blockSize;
+
+                    if (srcBlockX >= 0 && srcBlockX < atlasWBlocks && srcBlockY >= 0 && srcBlockY < atlasHBlocks
+                        && srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                    {
+                        Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
+                        usedBlocks[srcBlockY, srcBlockX] = true;
+                        if (saveMips && bx == 0 && by == 0 && _verboseLogging)
                             Console.WriteLine(
                                 $"Mip {mipLevel} first block srcBlock=({srcBlockX},{srcBlockY}) srcOffset={srcOffset} dstOffset={outputOffset}");
-                }
+                    }
 
-                outputOffset += blockSize;
-            }
+                    outputOffset += blockSize;
+                }
 
             // After copying all blocks for the mip, write out the mip as a separate DDS if requested
             var mipEndOffset = outputOffset;
@@ -2178,7 +2247,7 @@ public class DdxParser(bool verbose = false)
                     {
                         Width = (uint)mipWidth,
                         Height = (uint)mipHeight,
-                        Format = GetDxgiFormat(format),
+                        Format = TextureUtilities.GetDxgiFormat(format),
                         ActualFormat = format,
                         DataFormat = format,
                         MipLevels = 1
@@ -2195,7 +2264,7 @@ public class DdxParser(bool verbose = false)
         }
 
         // If we didn't extract the full mip tail, try to fill remaining bytes from unused atlas blocks
-        var mip0Size = CalculateMipSize(actualWidth, actualHeight, format);
+        var mip0Size = TextureUtilities.CalculateMipSize(actualWidth, actualHeight, format);
         var desiredTailBytes = (int)totalSize - mip0Size; // bytes excluding main surface
 
         if (_verboseLogging)
@@ -2208,18 +2277,18 @@ public class DdxParser(bool verbose = false)
                 Console.WriteLine("UnpackMipAtlas: filling remaining mip tail from unused atlas blocks");
 
             for (var by = 0; by < height / 4 && outputOffset < desiredTailBytes; by++)
-            for (var bx = 0; bx < atlasWidthInBlocks && outputOffset < desiredTailBytes; bx++)
-            {
-                if (usedBlocks[by, bx]) continue;
-
-                var srcOffset = (by * atlasWidthInBlocks + bx) * blockSize;
-                if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                for (var bx = 0; bx < atlasWidthInBlocks && outputOffset < desiredTailBytes; bx++)
                 {
-                    Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
-                    usedBlocks[by, bx] = true;
-                    outputOffset += blockSize;
+                    if (usedBlocks[by, bx]) continue;
+
+                    var srcOffset = (by * atlasWidthInBlocks + bx) * blockSize;
+                    if (srcOffset + blockSize <= atlasData.Length && outputOffset + blockSize <= output.Length)
+                    {
+                        Array.Copy(atlasData, srcOffset, output, outputOffset, blockSize);
+                        usedBlocks[by, bx] = true;
+                        outputOffset += blockSize;
+                    }
                 }
-            }
 
             if (_verboseLogging)
                 Console.WriteLine(
@@ -2299,6 +2368,74 @@ public class DdxParser(bool verbose = false)
             0x53 or 0x54 or 0x13 or 0x14 or 0x88 or 0x71 => 1,
             0x7B => 2,
             _ => 3
+        };
+    }
+
+    /// <summary>
+    ///     Gets the mip layout name for verbose logging.
+    /// </summary>
+    private static string GetMipLayoutName(int width, int height)
+    {
+        return (width, height) switch
+        {
+            (256, 192) => "256x192",
+            (1024, 1024) => "1024x1024",
+            (128, 320) => "128x320",
+            (320, 256) => "320x256",
+            _ => "calculated"
+        };
+    }
+
+    /// <summary>
+    ///     Gets the mip positions for a given atlas size.
+    ///     Returns positions as (x, y, w, h) in blocks (4x4 pixels per block).
+    /// </summary>
+    private static (int x, int y, int w, int h)[] GetMipPositions(int width, int height)
+    {
+        return (width, height) switch
+        {
+            (256, 192) =>
+            [
+                (0, 0, 16, 16), // Mip 0: 64x64 at (0,0)
+                (32, 0, 8, 8), // Mip 1: 32x32 at (128,0)
+                (4, 32, 4, 4), // Mip 2: 16x16 at (16,128)
+                (2, 32, 2, 2), // Mip 3: 8x8 at (8,128)
+                (1, 32, 1, 1), // Mip 4: 4x4 at (4,128)
+                (0, 34, 1, 1), // Mip 5: 2x2 at (0,136) - sub-block
+                (0, 33, 1, 1) // Mip 6: 1x1 at (0,132) - sub-block
+            ],
+            (128, 320) =>
+            [
+                // Measured for 128x512 texture with 128x320 atlas
+                // Convert to blocks (4x4 pixels per block): x/4, y/4, w/4, h/4
+                (0, 0, 16, 64), // Mip: 64x256 at (0,0)
+                (0, 64, 8, 16) // Mip: 32x64 at (0,256)
+            ],
+            (320, 256) =>
+            [
+                // 512x256 texture mips manually measured
+                (0, 0, 64, 32), // Mip 0: 256x128 at (0,0)
+                (0, 32, 32, 16), // Mip 1: 128x64 at (0,128)
+                (32, 32, 16, 8), // Mip 2: 64x32 at (128,128)
+                (64, 36, 8, 4), // Mip 3: 32x16 at (256,144)
+                (64, 34, 4, 2), // Mip 4: 16x8 at (256,136)
+                (64, 33, 2, 1), // Mip 5: 8x4 at (256,132)
+                (68, 32, 1, 1), // Mip 6: 4x2 at (272,128) - sub-block
+                (66, 32, 1, 1), // Mip 7: 2x1 at (264,128) - sub-block
+                (65, 32, 1, 1) // Mip 8: 1x1 at (260,128) - sub-block
+            ],
+            _ =>
+            [
+                // Default 256x256 atlas for 128x128 texture
+                (0, 0, 32, 32), // Mip 0: 128x128 at (0,0)
+                (32, 0, 16, 16), // Mip 1: 64x64 at (128,0)
+                (0, 32, 8, 8), // Mip 2: 32x32 at (0,128)
+                (36, 32, 4, 4), // Mip 3: 16x16 at (144,128)
+                (34, 32, 2, 2), // Mip 4: 8x8 at (136,128)
+                (33, 32, 1, 1), // Mip 5: 4x4 at (132,128)
+                (32, 34, 1, 1), // Mip 6: 2x2 at (128,136) - sub-block
+                (32, 33, 1, 1) // Mip 7: 1x1 at (128,132) - sub-block
+            ]
         };
     }
 

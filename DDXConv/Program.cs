@@ -27,6 +27,10 @@ if (opts.Contains("--help") || opts.Contains("-h"))
     Console.WriteLine("  --memory, -m         Use memory texture parser (handles memory dump layouts)");
     Console.WriteLine("  --atlas, -a          Save full untiled atlas as separate DDS file");
     Console.WriteLine();
+    Console.WriteLine("GUI Integration Options:");
+    Console.WriteLine("  --progress, -p       Output machine-parseable progress (batch mode only)");
+    Console.WriteLine("                       Format: [PROGRESS] STATUS <path> [error]");
+    Console.WriteLine();
     Console.WriteLine("Developer Options:");
     Console.WriteLine("  --raw, -r            Save raw combined decompressed data as binary file");
     Console.WriteLine("  --save-mips          Save extracted mip levels from atlas");
@@ -48,6 +52,23 @@ var noUntileAtlas = opts.Contains("--no-untile-atlas");
 var noUntile = opts.Contains("--no-untile");
 var skipEndianSwap = opts.Contains("--no-swap");
 var verbose = opts.Contains("--verbose") || opts.Contains("-v");
+var progressMode = opts.Contains("--progress") || opts.Contains("-p");
+
+// Thread-safe console output for progress mode
+var consoleLock = new object();
+
+void WriteProgress(string status, string path, string? error = null)
+{
+    if (!progressMode) return;
+    lock (consoleLock)
+    {
+        // Quote path to handle spaces; escape any quotes in error message
+        if (error != null)
+            Console.WriteLine($"[PROGRESS] {status} \"{path}\" {error.Replace("\"", "'")}");
+        else
+            Console.WriteLine($"[PROGRESS] {status} \"{path}\"");
+    }
+}
 
 if (Directory.Exists(inputPath))
 {
@@ -68,6 +89,9 @@ if (Directory.Exists(inputPath))
     var failed = new Dictionary<string, List<string>>();
     var invalids = 0;
 
+    if (progressMode)
+        Console.WriteLine($"[PROGRESS] START {ddxFiles.Length}");
+
     //foreach (var ddxFile in ddxFiles)
     Parallel.ForEach(ddxFiles, ddxFile =>
     {
@@ -86,20 +110,28 @@ if (Directory.Exists(inputPath))
 
                 if (result.Success)
                 {
-                    successes++;
+                    Interlocked.Increment(ref successes);
                     if (verbose) Console.WriteLine($"Converted {ddxFile} to {outputBatchPath}");
+                    WriteProgress("OK", ddxFile);
                 }
                 else
                 {
-                    errors++;
+                    Interlocked.Increment(ref errors);
                     if (verbose) Console.WriteLine($"Error converting {ddxFile}: {result.Error}");
-                    var error = result.Error ?? "Unknown error";
-                    if (!failed.ContainsKey(error))
-                        failed[error] = new List<string>();
-                    failed[error].Add(ddxFile);
+                    WriteProgress("FAIL", ddxFile, result.Error);
+                    lock (failed)
+                    {
+                        var error = result.Error ?? "Unknown error";
+                        if (!failed.ContainsKey(error))
+                            failed[error] = new List<string>();
+                        failed[error].Add(ddxFile);
+                    }
+
                     return;
                 }
-                if (!verbose) Console.Write($"\rConverted {successes} / {ddxFiles.Length} files, {errors} failed...");
+
+                if (!verbose && !progressMode)
+                    Console.Write($"\rConverted {successes} / {ddxFiles.Length} files, {errors} failed...");
             }
             else
             {
@@ -115,27 +147,38 @@ if (Directory.Exists(inputPath))
                         NoUntile = noUntile,
                         SkipEndianSwap = skipEndianSwap
                     });
-                successes++;
+                Interlocked.Increment(ref successes);
                 if (verbose) Console.WriteLine($"Converted {ddxFile} to {outputBatchPath}");
+                WriteProgress("OK", ddxFile);
             }
 
             if (regenMips) DdsPostProcessor.RegenerateMips(outputBatchPath);
         }
         catch (NotSupportedException)
         {
-            invalids++;
+            Interlocked.Increment(ref invalids);
+            WriteProgress("UNSUPPORTED", ddxFile);
         }
         catch (Exception ex)
         {
-            errors++;
+            Interlocked.Increment(ref errors);
             if (verbose) Console.WriteLine($"Error converting {ddxFile}: {ex.Message}");
-            if (!failed.ContainsKey(ex.Message))
-                failed[ex.Message] = new List<string>();
-            failed[ex.Message].Add(ddxFile);
+            WriteProgress("FAIL", ddxFile, ex.Message);
+            lock (failed)
+            {
+                if (!failed.ContainsKey(ex.Message))
+                    failed[ex.Message] = new List<string>();
+                failed[ex.Message].Add(ddxFile);
+            }
         }
-        
-        if (!verbose) Console.Write($"\rConverted {successes} / {ddxFiles.Length} files, {errors} failed, {invalids} unsupported...");
+
+        if (!verbose && !progressMode)
+            Console.Write(
+                $"\rConverted {successes} / {ddxFiles.Length} files, {errors} failed, {invalids} unsupported...");
     });
+
+    if (progressMode)
+        Console.WriteLine($"[PROGRESS] DONE {successes} {errors} {invalids}");
 
     if (pcFriendly)
     {
@@ -157,7 +200,7 @@ if (Directory.Exists(inputPath))
             }
         });
     }
-    
+
     Console.WriteLine(
         $"\nBatch conversion completed. Successfully converted {ddxFiles.Length - errors - invalids} out of {ddxFiles.Length} files ({errors} failures, {invalids} unsupported).");
     foreach (var kvp in failed)
